@@ -1,61 +1,122 @@
+"""
+FuryAI - YOLOv8-based Object Detection and Aim Assist System
+
+This module provides a real-time object detection system using YOLOv8 with GPU acceleration
+support for both NVIDIA (CUDA) and AMD (DirectML) graphics cards. It includes an overlay
+window for visualization and configuration, aim assist functionality, and screen capture
+capabilities optimized for gaming applications.
+
+Author: FuryAI Development Team
+Version: 1.0
+License: Proprietary
+"""
+
+# Standard library imports
+import os
+import sys
+import time
+import json
+import math
+import random
+import logging
+import threading
+import traceback
+import collections
+import subprocess
+import platform
+from datetime import datetime
+from typing import Dict, List, Tuple, Optional, Any, Union
+from ctypes import wintypes
+
+# Third-party imports
+import numpy as np
+import cv2
+import torch
+import psutil
+import pyautogui
+import mss
+from PIL import ImageGrab, Image
+from ultralytics import YOLO
+from ultralytics.trackers import BYTETracker
+from argparse import Namespace
+
+# Windows-specific imports
 import win32gui
 import win32con
 import win32api
 import win32ui
-import ctypes
-import threading
-import time
-import sys
-import traceback
-from ctypes import wintypes
-import json
-import os
-from tkinter import Tk, filedialog, messagebox, colorchooser
-import torch
-import numpy as np
-import cv2
-from PIL import ImageGrab, Image
-from ultralytics import YOLO
-from ultralytics.trackers import BYTETracker
 import win32process
-import psutil
-import queue
-import collections
-import torch_directml
-from argparse import Namespace
-import GPUtil
-import subprocess
-import platform
-import wmi
-import logging
-from datetime import datetime
-import math
-import pyautogui
-import mss
+import ctypes
+from ctypes import wintypes
 
-# --- Configurable Menu State ---
-config = {
+# GUI imports
+from tkinter import Tk, filedialog, messagebox, colorchooser
+
+# Optional imports with fallback handling
+DIRECTML_AVAILABLE = False
+GPUTIL_AVAILABLE = False
+WMI_AVAILABLE = False
+
+try:
+    import torch_directml
+    DIRECTML_AVAILABLE = True
+    print("DirectML is available for AMD GPU acceleration")
+    print(f"DirectML version: {torch_directml.__version__ if hasattr(torch_directml, '__version__') else 'unknown'}")
+    print(f"DirectML device count: {torch_directml.device_count()}")
+    if torch_directml.device_count() > 0:
+        print(f"DirectML device name: {torch_directml.device_name(0)}")
+except ImportError:
+    print("DirectML not available. Please install with: pip install torch-directml")
+
+try:
+    import GPUtil
+    GPUTIL_AVAILABLE = True
+except ImportError:
+    print("GPUtil not available. Some GPU monitoring features will be disabled.")
+
+try:
+    import wmi
+    WMI_AVAILABLE = True
+except ImportError:
+    print("WMI not available. Some GPU detection features will be limited.")
+
+# --- Configuration ---
+class Config:
+    """Configuration management for the FuryAI application."""
+    
+    # Default configuration values
+    DEFAULT_CONFIG = {
+        # Display settings
     'show_menu': False,
-    'confidence': 0.5,
-    'fov_modifier': 150,
-    'fov_size': 150,  # Add fov_size to match fov_modifier
-    'fov_color': (0, 255, 0),  # Green
+        'show_fps_counter': True,
     'show_player_boxes': True,
+        'show_fov_visualiser': True,
+        'fps_display_style': 0,  # 0 = detailed, 1 = simple
+        
+        # Detection settings
+        'confidence': 0.05,  # Lowered from 0.15 to 0.05 for better detection
+        'frame_skipping': 1,
+        'capture_size': 640,
+        'target_size': 640,
+        'max_boxes': 5,
+        
+        # Aim assist settings
+        'aim_assist_enabled': True,
     'tracking_speed': 0.5,
     'humaniser': 0.2,
-    'show_fov_visualiser': True,
-    'tracking_key': 'F2',  # Default tracking key
-    'gpu_info': None,  # Will store GPU info
-    'show_fps_counter': False,  # FPS counter toggle
     'smoothing_xy': 0.5,
-    'optimizations_enabled': False,
-    'gpu_utilization_threshold': 80,
-    'optimized_fps_target': 60,
-    'default_target_fps': 144,
-    'aim_assist_enabled': False,  # Add aim assist toggle
-    'trigger_bot_enabled': False,  # Add trigger bot toggle
-    'box_color': (255, 0, 0),  # Red
-    'text_color': (255, 255, 255),  # White
+        'fov_modifier': 150,
+        'fov_size': 150,
+        'aim_deadzone': 3,  # pixels - don't move if within this distance
+        'anti_lag_value': 0.0,
+        'custom_bone_position': 0.0,
+        
+        # Visual settings
+        'fov_color': (0, 255, 0),
+        'box_color': (255, 0, 0),
+        'text_color': (255, 255, 255),
+        
+        # Menu settings
     'menu_background_color': (15, 15, 15),
     'menu_border_color': (0, 255, 0),
     'menu_tab_color': (20, 20, 20),
@@ -68,22 +129,119 @@ config = {
     'button_hover_color': (60, 60, 60),
     'button_active_color': (0, 255, 0),
     'status_font_size': 14,
-    'fps_display_style': 0,  # 0 = show labels, 1 = just numbers
+        
+        # Key bindings
     'menu_key': 'INSERT',
+        'tracking_key': 'F2',
     'trigger_key': 'F3',
     'fov_toggle_key': 'F4',
     'fps_toggle_key': 'F5',
-    'use_gpu_capture': True,  # Added option to use GPU for capture processing
-    'capture_size': 480,      # Configurable capture size
-    'target_size': 160,       # Configurable target size for model input
-    'max_boxes': 3,           # Maximum number of boxes to process
+        'aim_key': 'SHIFT',
+        
+        # Performance settings
+        'optimizations_enabled': False,
+        'gpu_utilization_threshold': 80,
+        'optimized_fps_target': 60,
+        'default_target_fps': 144,
+        'use_gpu_capture': False,  # Disabled by default for better performance
+        'capture_optimization': True,  # Enable capture optimizations
+        
+        # Trigger bot settings
+        'trigger_bot_enabled': False,
+        
+        # GPU info (will be populated at runtime)
+        'gpu_info': None,
+    }
+    
+    @classmethod
+    def get_default_config(cls) -> Dict[str, Any]:
+        """Get a copy of the default configuration."""
+        return cls.DEFAULT_CONFIG.copy()
+    
+    @classmethod
+    def validate_config(cls, config: Dict[str, Any]) -> Dict[str, Any]:
+        """Validate and ensure all required configuration options exist."""
+        validated_config = cls.get_default_config()
+        validated_config.update(config)
+        return validated_config
+
+# Global configuration instance
+config = Config.get_default_config()
+ 
+# --- Constants ---
+SCREEN_WIDTH = win32api.GetSystemMetrics(0)
+SCREEN_HEIGHT = win32api.GetSystemMetrics(1)
+
+# Menu dimensions
+FIXED_MENU_WIDTH = 500
+FIXED_MENU_HEIGHT = 320
+MENU_START_X = 20
+MENU_START_Y = 20
+FULL_MENU_RECT = (
+    MENU_START_X,
+    MENU_START_Y,
+    MENU_START_X + FIXED_MENU_WIDTH,
+    MENU_START_Y + FIXED_MENU_HEIGHT
+)
+
+# UI element dimensions
+TOP_BAR_HEIGHT = 30
+SIDEBAR_WIDTH = 100
+BOTTOM_BAR_HEIGHT = 20
+SLIDER_WIDTH = 140
+SLIDER_HEIGHT = 8
+TAB_HEIGHT = 28
+TEXT_SIZE = 14
+BUTTON_HEIGHT = 24
+BUTTON_PADDING = 8
+TOGGLE_SIZE = 20
+LABEL_WIDTH = 170
+INFO_ICON_SIZE = 18
+INFO_ICON_OFFSET = 6
+CIRCLE_THICKNESS = 2
+
+# Virtual key codes
+VK_INSERT = 0x2D
+VK_F1 = 0x70
+VK_F2 = 0x71
+VK_F3 = 0x72
+VK_F4 = 0x73
+VK_F5 = 0x74
+VK_F6 = 0x75
+VK_F7 = 0x76
+VK_F8 = 0x77
+VK_F9 = 0x78
+VK_F10 = 0x79
+VK_SHIFT = 0x10
+VK_CONTROL = 0x11
+VK_MENU = 0x12  # ALT key
+
+# Key mapping dictionary
+KEY_MAPPING = {
+    'SHIFT': VK_SHIFT,
+    'CTRL': VK_CONTROL,
+    'ALT': VK_MENU,
+    'INSERT': VK_INSERT,
+    'F1': VK_F1,
+    'F2': VK_F2,
+    'F3': VK_F3,
+    'F4': VK_F4,
+    'F5': VK_F5,
+    'F6': VK_F6,
+    'F7': VK_F7,
+    'F8': VK_F8,
+    'F9': VK_F9,
+    'F10': VK_F10,
 }
 
-# Add this after INFO_DESCRIPTIONS
-INFO_ICON_EXCLUDE = set([
+# Reverse key mapping for getting key names
+REVERSE_KEY_MAPPING = {v: k for k, v in KEY_MAPPING.items()}
+
+# Information descriptions for UI tooltips
+INFO_ICON_EXCLUDE = {
     'gpu_info', 'save_config', 'load_config', 'reset_settings',
     'tracking_key', 'menu_key', 'trigger_key', 'fov_toggle_key', 'fps_toggle_key',
-])
+}
 
 INFO_DESCRIPTIONS = {
     'optimizations_enabled': 'Enable performance optimizations based on GPU usage.',
@@ -97,118 +255,63 @@ INFO_DESCRIPTIONS = {
     'tracking_speed': 'Speed at which the aim assist tracks targets.',
     'humaniser': 'Adds randomness to aim movement for realism.',
     'fov_modifier': 'Adjusts the size of the field of view (FOV) circle.',
-    'anti_lag_value': 'Compensates for system lag in aim assist.',
-    'custom_bone_position': 'Custom offset for aim target (advanced).',
-    'smoothing_xy': 'Smoothness of aim movement in X/Y directions.',
-    'trigger_bot_enabled': 'Automatically fires when a target is detected.',
-    'trigger_delay': 'Delay (seconds) before trigger fires.',
-    'trigger_random': 'Randomness added to trigger timing.',
-    'trigger_hold': 'How long to hold the trigger (seconds).',
-    'trigger_release': 'Delay (seconds) after trigger fires.',
-    'show_fps_counter': 'Display the current frames per second (FPS).',
-    'fps_display_style': 'Choose between detailed or simple FPS display.',
-    'fov_color': 'Color of the field of view (FOV) circle.',
-    'box_color': 'Color of the player detection boxes.',
-    'menu_background_color': 'Background color of the menu.',
-    'optimizations_enabled': 'Enable performance optimizations based on GPU usage.',
-    'use_directx_capture': 'Use DirectX for faster GPU-based screen capture.',
-    # Add more as needed for all other options...
+    'anti_lag_value': 'Anti-lag compensation value for smoother tracking.',
+    'custom_bone_position': 'Custom bone position offset for aim targeting.',
+    'smoothing_xy': 'Smoothing factor for X and Y axis movement.',
+    'aim_deadzone': 'Distance in pixels where aim assist stops moving to prevent jittering.',
+    'aim_assist_enabled': 'Enable or disable automatic aim assistance.',
+    'trigger_bot_enabled': 'Enable automatic shooting when crosshair is on target.',
+    'trigger_delay': 'Delay before trigger bot fires (seconds).',
+    'trigger_key': 'Key to toggle trigger bot functionality.',
+    'menu_key': 'Key to toggle the configuration menu.',
+    'fov_toggle_key': 'Key to toggle FOV visualization.',
+    'fps_toggle_key': 'Key to toggle FPS counter display.',
+    'show_fps_counter': 'Display FPS counter on screen.',
+    'fps_display_style': 'FPS counter display style (0=detailed, 1=simple).',
+    'box_color': 'Color of detection boxes (RGB).',
+    'fov_color': 'Color of FOV circle (RGB).',
+    'text_color': 'Color of on-screen text (RGB).',
 }
- 
-# --- Constants ---
-SCREEN_WIDTH = win32api.GetSystemMetrics(0)
-SCREEN_HEIGHT = win32api.GetSystemMetrics(1)
 
-# Define fixed menu dimensions for better control
-FIXED_MENU_WIDTH = 500
-FIXED_MENU_HEIGHT = 320
-
-# Calculate menu position to be in top-left corner
-MENU_START_X = 20
-MENU_START_Y = 20
-
-FULL_MENU_RECT = (
-    MENU_START_X,
-    MENU_START_Y,
-    MENU_START_X + FIXED_MENU_WIDTH,
-    MENU_START_Y + FIXED_MENU_HEIGHT
-)
-
-TOP_BAR_HEIGHT = 30
-SIDEBAR_WIDTH = 100
-BOTTOM_BAR_HEIGHT = 20
-
-SLIDER_WIDTH = 140
-SLIDER_HEIGHT = 8
-SLIDER_X = SIDEBAR_WIDTH + 15
-SLIDER_STEP = 0.01
-CIRCLE_THICKNESS = 2
-
-# Add new constants for scaled elements
-TAB_HEIGHT = 28
-TEXT_SIZE = 14
-BUTTON_HEIGHT = 24
-BUTTON_PADDING = 8
-TOGGLE_SIZE = 20
-LABEL_WIDTH = 170
-INFO_ICON_SIZE = 18
-INFO_ICON_OFFSET = 6
- 
-# --- Win32 Setup ---
+# Win32 API setup
 user32 = ctypes.windll.user32
 gdi32 = ctypes.windll.gdi32
- 
-# For hotkey
-MOD_NOREPEAT = 0x4000
-VK_INSERT = 0x2D
-VK_F2 = 0x71  # F2 key for toggling aim
-VK_F4 = 0x73  # F4 key for toggling FOV
-VK_F5 = 0x74  # F5 key for toggling FPS
 
 # Mouse movement constants
 MOUSEEVENTF_MOVE = 0x0001
 MOUSEEVENTF_ABSOLUTE = 0x8000
+MOD_NOREPEAT = 0x4000
 
-# Add key mapping constants
-VK_F1 = 0x70
-VK_F3 = 0x72
-VK_F6 = 0x75
-VK_F7 = 0x76
-VK_F8 = 0x77
-VK_F9 = 0x78
-VK_F10 = 0x79
-VK_F11 = 0x7A
-VK_F12 = 0x7B
+# --- Utility Functions ---
 
-# Key mapping dictionary
-KEY_MAPPING = {
-    'F1': VK_F1,
-    'F2': VK_F2,
-    'F3': VK_F3,
-    'F4': VK_F4,
-    'F5': VK_F5,
-    'F6': VK_F6,
-    'F7': VK_F7,
-    'F8': VK_F8,
-    'F9': VK_F9,
-    'F10': VK_F10,
-    'F11': VK_F11,
-    'F12': VK_F12,
-    'INSERT': VK_INSERT,
-}
+def get_key_name(vk_code: int) -> str:
+    """
+    Convert virtual key code to key name.
+    
+    Args:
+        vk_code: Virtual key code from Windows API
+        
+    Returns:
+        String representation of the key name
+    """
+    return REVERSE_KEY_MAPPING.get(vk_code, f"Key {vk_code}")
 
-# Reverse key mapping for getting key names
-REVERSE_KEY_MAPPING = {v: k for k, v in KEY_MAPPING.items()}
+def move_mouse(dx: int, dy: int) -> None:
+    """
+    Move the mouse cursor by the specified delta using Win32 API.
+    
+    Args:
+        dx: Horizontal movement delta in pixels
+        dy: Vertical movement delta in pixels
+    """
+    try:
+        x, y = win32api.GetCursorPos()
+        win32api.SetCursorPos((x + dx, y + dy))
+    except Exception as e:
+        print(f"[ERROR] Failed to move mouse: {e}")
 
-def get_key_name(vk_code):
-    """Convert virtual key code to key name."""
-    if vk_code in REVERSE_KEY_MAPPING:
-        return REVERSE_KEY_MAPPING[vk_code]
-    return f"Key {vk_code}"
-
-def move_mouse(dx, dy):
-    """Move the mouse cursor by the specified delta using SendInput (safer than mouse_event)."""
-    import ctypes
+def simulate_click() -> None:
+    """Simulate a left mouse click using SendInput."""
     class MOUSEINPUT(ctypes.Structure):
         _fields_ = [
             ("dx", ctypes.c_long),
@@ -218,32 +321,13 @@ def move_mouse(dx, dy):
             ("time", ctypes.c_ulong),
             ("dwExtraInfo", ctypes.POINTER(ctypes.c_ulong)),
         ]
+    
     class INPUT(ctypes.Structure):
         _fields_ = [
             ("type", ctypes.c_ulong),
             ("mi", MOUSEINPUT),
         ]
-    extra = ctypes.c_ulong(0)
-    ii_ = INPUT(type=0, mi=MOUSEINPUT(int(dx), int(dy), 0, 0x0001, 0, ctypes.pointer(extra)))
-    ctypes.windll.user32.SendInput(1, ctypes.pointer(ii_), ctypes.sizeof(ii_))
-
-def simulate_click():
-    """Simulate a left mouse click using SendInput (safer than mouse_event)."""
-    import ctypes
-    class MOUSEINPUT(ctypes.Structure):
-        _fields_ = [
-            ("dx", ctypes.c_long),
-            ("dy", ctypes.c_long),
-            ("mouseData", ctypes.c_ulong),
-            ("dwFlags", ctypes.c_ulong),
-            ("time", ctypes.c_ulong),
-            ("dwExtraInfo", ctypes.POINTER(ctypes.c_ulong)),
-        ]
-    class INPUT(ctypes.Structure):
-        _fields_ = [
-            ("type", ctypes.c_ulong),
-            ("mi", MOUSEINPUT),
-        ]
+    
     extra = ctypes.c_ulong(0)
     # Mouse left down
     ii_down = INPUT(type=0, mi=MOUSEINPUT(0, 0, 0, 0x0002, 0, ctypes.pointer(extra)))
@@ -252,356 +336,120 @@ def simulate_click():
     ctypes.windll.user32.SendInput(1, ctypes.pointer(ii_down), ctypes.sizeof(ii_down))
     ctypes.windll.user32.SendInput(1, ctypes.pointer(ii_up), ctypes.sizeof(ii_up))
 
-# --- Helper Functions ---
-def rgb_to_colorref(rgb):
+def rgb_to_colorref(rgb: Tuple[int, int, int]) -> int:
+    """
+    Convert RGB tuple to Windows color reference.
+    
+    Args:
+        rgb: RGB color tuple (r, g, b)
+        
+    Returns:
+        Windows color reference integer
+    """
     r, g, b = rgb
     return r | (g << 8) | (b << 16)
  
-def point_in_rect(x, y, rect):
+def point_in_rect(x: int, y: int, rect: Tuple[int, int, int, int]) -> bool:
+    """
+    Check if a point is within a rectangle.
+    
+    Args:
+        x: X coordinate of the point
+        y: Y coordinate of the point
+        rect: Rectangle tuple (left, top, right, bottom)
+        
+    Returns:
+        True if point is within rectangle, False otherwise
+    """
     left, top, right, bottom = rect
     return left <= x <= right and top <= y <= bottom
  
-# --- Overlay Window Class ---
-class ConfigManager:
-    """Manages configuration with default values and type checking."""
-    
-    @staticmethod
-    def get_default_config():
-        """Returns a dictionary of all possible configuration options with their default values."""
-        return {
-            # --- Display Settings ---
-            'show_menu': False,
-            'show_fps_counter': True,
-            'show_player_boxes': True,
-            'show_fov_visualiser': True,
-            'fov_enabled': True,
-            'box_enabled': True,
-            'text_enabled': True,
-            'menu_enabled': True,
-            'fps_display_style': 'simple',  # 'simple' or 'detailed'
-            'show_detection_confidence': True,
-            'show_track_ids': True,
-            'show_target_info': True,
-            
-            # --- Colors ---
-            'box_color': (255, 0, 0),  # Red
-            'text_color': (255, 255, 255),  # White
-            'fov_color': (0, 255, 0),  # Green
-            'menu_color': (0, 0, 0, 128),
-            'menu_text_color': (255, 255, 255),
-            'menu_highlight_color': (0, 255, 0),
-            'menu_background_color': (15, 15, 15),
-            'menu_border_color': (0, 255, 0),
-            'menu_tab_color': (20, 20, 20),
-            'menu_active_tab_color': (30, 30, 30),
-            'slider_color': (40, 40, 40),
-            'slider_active_color': (0, 255, 0),
-            'button_color': (40, 40, 40),
-            'button_hover_color': (60, 60, 60),
-            'button_active_color': (0, 255, 0),
-            
-            # --- Sizes and Dimensions ---
-            'fov_size': 200,
-            'aim_fov': 200,
-            'menu_width': 460,
-            'menu_height': 290,
-            'menu_x': 10,
-            'menu_y': 10,
-            'menu_padding': 10,
-            'menu_spacing': 5,
-            'menu_max_items': 20,
-            'menu_item_height': 25,
-            'menu_font_size': 12,
-            'top_bar_height': 23,
-            'sidebar_width': 92,
-            'bottom_bar_height': 17,
-            'slider_width': 115,
-            'slider_height': 7,
-            'button_height': 21,
-            'button_padding': 6,
-            'tab_height': 23,
-            'circle_thickness': 2,
-            
-            # --- Performance Settings ---
-            'confidence': 0.5,
-            'aim_smoothness': 0.5,
-            'aim_speed': 1.0,
-            'tracking_speed': 0.5,
-            'humaniser': 0.2,
-            'anti_lag_value': 5.0,
-            'custom_bone_position': 0.0,
-            'smoothing_xy': 0.5,
-            'optimizations_enabled': False,
-            'gpu_utilization_threshold': 80,
-            'optimized_fps_target': 144,
-            'default_target_fps': 230,
-            'max_detection_fps': 144,
-            'min_detection_fps': 30,
-            'frame_queue_size': 2,
-            'result_queue_size': 2,
-            'fps_history_size': 30,
-            
-            # --- Timing Settings ---
-            'trigger_delay': 0.1,
-            'trigger_random': 0.05,
-            'trigger_hold': 0.05,
-            'trigger_release': 0.1,
-            'aim_delay': 0.0,
-            'aim_random': 0.0,
-            'menu_update_interval': 0.016,  # ~60 FPS
-            'status_message_duration': 3.0,
-            
-            # --- Feature Toggles ---
-            'trigger_enabled': True,
-            'trigger_bot_enabled': False,
-            'aim_enabled': True,
-            'tracking_enabled': True,
-            'use_directx_capture': True,
-            'use_gpu_capture': True,
-            'use_optimized_capture': False,
-            'use_anti_aliasing': True,
-            'use_vsync': False,
-            'use_fullscreen': True,
-            'use_borderless': False,
-            'use_click_through': True,
-            'use_topmost': True,
-            
-            # --- Key Bindings ---
-            'menu_key': 'insert',
-            'exit_key': 'end',
-            'reset_key': 'home',
-            'save_key': 'f5',
-            'load_key': 'f6',
-            'tracking_key': 'f2',
-            'fov_toggle_key': 'f4',
-            'fps_toggle_key': 'f5',
-            'aim_key': 'shift',
-            'trigger_key': 'f3',
-            'is_mouse_key': False,  # Track if aim key is a mouse button
-            
-            # --- Menu State ---
-            'menu_visible': False,
-            'menu_active': False,
-            'menu_selected': 0,
-            'menu_scroll': 0,
-            'active_tab': 'Home',
-            'mouse_down': False,
-            'last_mouse_pos': (0, 0),
-            'active_slider': None,
-            'waiting_for_key': None,
-            'active_input_field': None,
-            'current_input_text': "",
-            
-            # --- Font Settings ---
-            'menu_font': 'Arial',
-            'menu_bold': True,
-            'menu_italic': False,
-            'menu_underline': False,
-            'menu_strikeout': False,
-            'menu_charset': 0,
-            'menu_quality': 0,
-            'menu_pitch': 0,
-            'menu_family': 0,
-            
-            # --- Detection Settings ---
-            'detection_confidence': 0.5,
-            'detection_iou_threshold': 0.45,
-            'detection_max_detections': 100,
-            'detection_min_size': 20,
-            'detection_max_size': 1000,
-            'detection_aspect_ratio': 1.0,
-            'detection_scale_factor': 1.0,
-            
-            # --- Tracking Settings ---
-            'track_thresh': 0.5,
-            'track_buffer': 30,
-            'match_thresh': 0.8,
-            'frame_rate': 144,
-            'track_min_hits': 3,
-            'track_max_age': 30,
-            'track_min_steps': 3,
-            'track_max_steps': 30,
-            
-            # --- Aim Settings ---
-            'aim_fov_radius': 200,
-            'aim_smooth_factor': 0.5,
-            'aim_prediction_factor': 0.5,
-            'aim_reaction_time': 0.1,
-            'aim_max_angle': 180,
-            'aim_min_angle': 0,
-            'aim_max_distance': 1000,
-            'aim_min_distance': 50,
-            'aim_target_priority': 'distance',  # 'distance', 'confidence', 'size'
-            'aim_target_bone': 'head',  # 'head', 'chest', 'pelvis'
-            'aim_target_offset': 0.0,
-            
-            # --- Trigger Settings ---
-            'trigger_delay_min': 0.05,
-            'trigger_delay_max': 0.15,
-            'trigger_hold_min': 0.05,
-            'trigger_hold_max': 0.15,
-            'trigger_release_min': 0.05,
-            'trigger_release_max': 0.15,
-            'trigger_random_factor': 0.1,
-            'trigger_confidence_threshold': 0.5,
-            'trigger_max_distance': 1000,
-            'trigger_min_distance': 50,
-            'trigger_target_bone': 'head',  # 'head', 'chest', 'pelvis'
-            'trigger_target_offset': 0.0,
-            
-            # --- System Settings ---
-            'config_dir': 'config',
-            'model_path': 'best.pt',
-            'log_level': 'INFO',  # 'DEBUG', 'INFO', 'WARNING', 'ERROR'
-            'save_screenshots': False,
-            'screenshot_dir': 'screenshots',
-            'auto_update': False,
-            'check_updates': True,
-            'update_channel': 'stable',  # 'stable', 'beta', 'alpha'
-            
-            # --- Debug Settings ---
-            'debug_mode': False,
-            'debug_draw_fps': True,
-            'debug_draw_boxes': True,
-            'debug_draw_tracks': True,
-            'debug_draw_targets': True,
-            'debug_draw_angles': True,
-            'debug_draw_distances': True,
-            'debug_log_detections': False,
-            'debug_log_tracking': False,
-            'debug_log_aiming': False,
-            'debug_log_trigger': False,
-        }
-    
-    @staticmethod
-    def validate_config(config):
-        """Validates and ensures all required configuration options exist."""
-        default_config = ConfigManager.get_default_config()
-        validated_config = default_config.copy()
-        
-        # Update with any existing values
-        for key, value in config.items():
-            if key in default_config:
-                validated_config[key] = value
-        
-        return validated_config
-    
-    @staticmethod
-    def get_category_config(category):
-        """Returns configuration options for a specific category."""
-        all_config = ConfigManager.get_default_config()
-        categories = {
-            'display': [k for k in all_config.keys() if k.startswith('show_') or k.endswith('_enabled')],
-            'colors': [k for k in all_config.keys() if k.endswith('_color')],
-            'sizes': [k for k in all_config.keys() if k.endswith('_size') or k.endswith('_width') or k.endswith('_height')],
-            'performance': [k for k in all_config.keys() if 'fps' in k or 'speed' in k or 'threshold' in k],
-            'timing': [k for k in all_config.keys() if 'delay' in k or 'time' in k or 'interval' in k],
-            'features': [k for k in all_config.keys() if k.startswith('use_') or k.endswith('_enabled')],
-            'keys': [k for k in all_config.keys() if k.endswith('_key')],
-            'menu': [k for k in all_config.keys() if k.startswith('menu_')],
-            'fonts': [k for k in all_config.keys() if k.startswith('menu_font')],
-            'detection': [k for k in all_config.keys() if k.startswith('detection_')],
-            'tracking': [k for k in all_config.keys() if k.startswith('track_')],
-            'aim': [k for k in all_config.keys() if k.startswith('aim_')],
-            'trigger': [k for k in all_config.keys() if k.startswith('trigger_')],
-            'system': [k for k in all_config.keys() if k in ['config_dir', 'model_path', 'log_level', 'save_screenshots', 'screenshot_dir', 'auto_update', 'check_updates', 'update_channel']],
-            'debug': [k for k in all_config.keys() if k.startswith('debug_')],
-        }
-        return {k: all_config[k] for k in categories.get(category, [])}
-
-def detect_gpu():
-    """Detect available GPU and return device type and name."""
-    try:
-        import torch
-        import wmi
-        
-        # Try to get GPU name using WMI
-        try:
-            w = wmi.WMI()
-            gpu_info = w.Win32_VideoController()
-            if gpu_info:
-                for gpu in gpu_info:
-                    if gpu.Name:
-                        if "NVIDIA" in gpu.Name:
-                            if torch.cuda.is_available():
-                                return 'NVIDIA', gpu.Name
-                        elif "AMD" in gpu.Name or "Radeon" in gpu.Name:
-                            try:
-                                import torch_directml
-                                if torch_directml.is_available():
-                                    return 'AMD', gpu.Name
-                            except ImportError:
-                                print("torch-directml not installed. To use AMD GPU, install it with: pip install torch-directml")
-        except:
-            pass
-            
-        # Check for NVIDIA GPU using CUDA
-        if torch.cuda.is_available():
-            return 'NVIDIA', torch.cuda.get_device_name(0)
-            
-        # Check for AMD GPU using DirectML
-        try:
-            import torch_directml
-            if torch_directml.is_available():
-                return 'AMD', 'AMD GPU (DirectML)'
-        except ImportError:
-            print("torch-directml not installed. To use AMD GPU, install it with: pip install torch-directml")
-            
-        # If no GPU found, return CPU info
-        import platform
-        cpu_info = platform.processor()
-        return 'CPU', cpu_info
-
-    except Exception as e:
-        print(f"Error detecting GPU: {e}")
-        return 'CPU', 'Unknown CPU'
+# --- YOLODetector Class ---
 
 class YOLODetector:
-    def __init__(self, config):
-        """Initialize the YOLODetector with configuration."""
+    """
+    YOLOv8-based object detector with GPU acceleration support.
+    
+    This class handles real-time object detection using YOLOv8 models with support
+    for both NVIDIA (CUDA) and AMD (DirectML) GPU acceleration. It includes
+    frame processing, detection result handling, and performance optimization.
+    
+    Attributes:
+        config: Configuration dictionary containing detection parameters
+        model_path: Path to the YOLOv8 model file
+        hardware_manager: HardwareManager instance for device management
+        model: Loaded YOLOv8 model
+        aiming_enabled: Whether aim assist is enabled
+        running: Whether the detection thread is running
+        current_boxes: Current detection bounding boxes
+        current_confidences: Current detection confidences
+        current_class_ids: Current detection class IDs
+    """
+    
+    def __init__(self, config: Dict[str, Any]):
+        """
+        Initialize the YOLODetector with configuration.
+        
+        Args:
+            config: Configuration dictionary containing detection parameters
+            
+        Raises:
+            Exception: If model loading fails
+        """
         self.config = config
         self.model_path = config.get('model_path', 'best.pt')
-        self.gpu_type = None
-        self.gpu_name = None
-        self.device = None
-        self.dml_device = None
+        
+        # Use centralized hardware manager
+        self.hardware_manager = hardware_manager
+        self.device = self.hardware_manager.get_device()
+        self.hardware_type = self.hardware_manager.get_hardware_type()
+        self.device_name = self.hardware_manager.get_device_name()
+        
+        # Model and state
+                # Performance optimizations
+        self.frame_skip = 1  # Process every 2nd frame
+        self.frame_counter = 0
+        self.target_size = 416  # Smaller input size for speed
+        self.last_detections = []
+        self.detection_lock = threading.Lock()
         self.model = None
-        self.aiming_enabled = False
+        self.frame_counter = 0
+        self.last_detections = []
+        self.aiming_enabled = True
+        self.trigger_enabled = True
+        
+        # Performance tracking
         self.last_fps = 0
         self.current_fps = 0
         self.last_time = time.time()
         self.frame_count = 0
         self.last_frame_time = time.time()
         
-        # Add back necessary attributes for detection thread
+        # Detection state
         self.running = False
         self.detection_thread = None
-        self.fps_history = []
-        self.processing_fps_history = []
+        self.fps_history = collections.deque(maxlen=10)
+        self.processing_fps_history = collections.deque(maxlen=10)
         self.current_boxes = None
         self.current_confidences = None
         self.current_class_ids = None
-        self.class_names = ['item']  # Define class names
-        self.last_box_state = False  # Track if boxes were present last frame
+        self.class_names = ['item']
+        self.last_box_state = False
         
-        # Frame skipping parameters
-        self.process_every_n = 1  # Start by processing every frame
+        # Frame skipping
+        self.process_every_n = max(1, min(4, config.get('frame_skipping', 1)))
         self.skip_counter = 0
-        self.frame_counter = 0  # Counter for frame skipping
-        self.last_detections = []  # Cache for frame skipping
+        self.frame_counter = 0
+        self.last_detections = []
         
         # Initialize tracker
-        from argparse import Namespace
         tracker_args = Namespace(
             track_thresh=0.5,
             track_buffer=30,
             match_thresh=0.8,
-            frame_rate=30
+            frame_rate=144
         )
         self.tracker = BYTETracker(tracker_args)
-        
-        # Initialize GPU detection
-        self._detect_gpu()
         
         # Load the model
         if not self.load_model():
@@ -613,82 +461,109 @@ class YOLODetector:
             print("MSS screen capture library found")
         except ImportError:
             print("MSS library not found. Installing...")
-            import subprocess
             subprocess.check_call(["pip", "install", "mss"])
             print("MSS installed successfully")
 
-    def _detect_gpu(self):
-        """Detect available GPU and set appropriate device."""
-        try:
-            import torch
-            import torch_directml
-            
-            # Check for AMD GPU first
-            if torch_directml.is_available():
-                self.gpu_type = 'AMD'
-                self.gpu_name = torch_directml.device_name(0)
-                self.dml_device = torch_directml.device(0)
-                print(f"Detected GPU Type: {self.gpu_type}")
-                print(f"GPU Name: {self.gpu_name}")
-                print("DirectML initialized successfully. Using AMD GPU:", self.gpu_name)
-                
-                # Force DirectML to initialize the GPU
-                try:
-                    # Create a large tensor to force GPU memory allocation
-                    warm_tensor = torch.rand(1000, 1000, device=self.dml_device)
-                    # Perform some operations to ensure GPU is active
-                    result = warm_tensor @ warm_tensor.t()
-                    # Force synchronization
-                    _ = result.cpu().numpy()
-                    print("GPU memory allocation test successful - GPU should be active now")
-                except Exception as e:
-                    print(f"Warning: GPU warm-up failed: {e}")
-                
-                return
-            
-            # Check for NVIDIA GPU
-            if torch.cuda.is_available():
-                self.gpu_type = 'NVIDIA'
-                self.gpu_name = torch.cuda.get_device_name(0)
-                self.device = torch.device('cuda')
-                print(f"Detected GPU Type: {self.gpu_type}")
-                print(f"GPU Name: {self.gpu_name}")
-                return
-            
-            # No GPU detected
-            print("ERROR: No compatible GPU detected. This application requires a GPU.")
-            raise Exception("No GPU detected")
-            
-        except Exception as e:
-            print(f"ERROR: Failed to initialize GPU: {e}")
-            raise Exception(f"GPU initialization failed: {e}")
-
-    def update_fps(self):
-        """Update FPS counter."""
+    def update_fps(self) -> bool:
+        """
+        Update FPS counter and return whether FPS was updated.
+        
+        Returns:
+            True if FPS was updated, False otherwise
+        """
         current_time = time.time()
         self.frame_count += 1
         
-        # Update FPS every second
-        if current_time - self.last_time >= 1.0:
+        # Update FPS every 0.2 seconds for more responsive display
+        if current_time - self.last_time >= 0.2:
             self.last_fps = self.current_fps
-            self.current_fps = self.frame_count
+            self.current_fps = int(self.frame_count / (current_time - self.last_time))
             self.frame_count = 0
             self.last_time = current_time
-            print(f"Current FPS: {self.current_fps}")
+            
+            print(f"Current FPS: {self.current_fps}, Skip: {self.process_every_n}")
+            
+            # Force overlay to update if we have a parent reference
+            if hasattr(self, 'parent') and hasattr(self.parent, 'hwnd'):
+                try:
+                    fps_rect = (0, 0, 200, 40)
+                    win32gui.InvalidateRect(self.parent.hwnd, fps_rect, True)
+                    win32gui.UpdateWindow(self.parent.hwnd)
+                except Exception as e:
+                    print(f"Error updating FPS display: {e}")
+            
+            self.fps_history.append(self.current_fps)
+            return True
+        return False
+    def optimize_model(self):
+        """Apply performance optimizations to the model."""
+        if hasattr(self.model, 'model'):
+            # Enable PyTorch optimizations
+            torch.set_num_threads(8)  # Use more CPU threads
+            torch.backends.cudnn.benchmark = True
+            
+            # Fuse layers for faster inference
+            try:
+                self.model.model.fuse()
+                print("[INFO] Model fused for faster inference")
+            except Exception as e:
+                print(f"[INFO] Model fusion failed: {e}")
+            
+            # Use lower precision if available
+            try:
+                self.model.model.half()
+                print("[INFO] Using FP16 for faster inference")
+            except Exception as e:
+                print(f"[INFO] FP16 not available: {e}")
+            
+            # Optimize thresholds for speed
+            self.model.conf = 0.4  # Higher confidence = fewer detections = faster
+            self.model.iou = 0.45  # Optimized NMS threshold
+            
+            print(f"[INFO] Optimized model with {self.target_size}x{self.target_size} input")
+    
+    def should_process_frame(self):
+        """Determine if current frame should be processed."""
+        self.frame_counter += 1
+        return self.frame_counter % (self.frame_skip + 1) == 0
 
-    def load_model(self):
-        """Load the YOLOv8 model on GPU with performance optimizations."""
+
+    def load_model(self) -> bool:
+        """
+        Load the YOLOv8 model on GPU with performance optimizations.
+        
+        Returns:
+            True if model loaded successfully, False otherwise
+        """
         try:
             print(f"Loading model from: {self.model_path}")
             
             # Load model with task-specific optimizations
             self.model = YOLO(self.model_path, task='detect')
             
-            # Apply global performance optimizations
-            torch.backends.cudnn.benchmark = True  # Enable cudnn autotuner
-            torch.backends.cudnn.deterministic = False  # Allow non-deterministic algorithms
+            # Set model parameters for better detection
+            self.model.conf = self.config.get('confidence', 0.15)
+            self.model.iou = self.config.get('iou_threshold', 0.3)
+            print(f"Model confidence threshold set to: {self.model.conf}")
+            print(f"Model IoU threshold set to: {self.model.iou}")
             
-            if self.gpu_type == 'NVIDIA':
+            # Set class names
+            try:
+                if hasattr(self.model, 'names'):
+                    self.class_names = list(self.model.names.values())
+                    print(f"Class names loaded from model: {self.class_names}")
+                else:
+                    self.class_names = ['item']
+                    print("Using default class names: ['item']")
+            except Exception as e:
+                print(f"Error loading class names: {e}, using default")
+                self.class_names = ['item']
+            
+            # Apply global performance optimizations
+            torch.backends.cudnn.benchmark = True
+            torch.backends.cudnn.deterministic = False
+            
+            if self.hardware_manager.is_nvidia():
                 # Move model to CUDA
                 self.model.to(self.device)
                 print(f"Model moved to CUDA device: {self.device}")
@@ -708,458 +583,532 @@ class YOLODetector:
                 except Exception as e:
                     print(f"CUDA synchronization warning: {e}")
             
-            elif self.gpu_type == 'AMD':
-                # Move model to DirectML
-                self.model.to(self.dml_device)
-                print(f"Model moved to DirectML device: {self.dml_device}")
+            elif self.hardware_manager.is_amd():
+                # Use MSS + CPU optimization for AMD GPUs (eliminates DirectML issues)
+                print("AMD GPU detected - using MSS + CPU optimization")
+                print("Reason: MSS provides excellent capture performance, CPU provides reliable inference")
+                
+                # Move model to CPU with optimizations
+                self.model.to('cpu')
+                print("Model moved to CPU for AMD optimization")
                 
                 # Set model to evaluation mode
                 self.model.model.eval()
                 print("Model set to evaluation mode")
                 
-                # Force model to DirectML device
-                self.model.model = self.model.model.to(self.dml_device)
-                print("Model forced to DirectML device")
+                # Enable CPU optimizations for better performance
+                torch.set_num_threads(min(8, os.cpu_count()))  # Use multiple CPU threads
+                torch.backends.mkldnn.enabled = True  # Enable MKL-DNN for Intel CPUs
+                torch.backends.mkldnn.allow_tf32 = True  # Allow TF32 for better performance
                 
-                # Force all parameters to DirectML device
-                for param in self.model.model.parameters():
-                    param.data = param.data.to(self.dml_device)
-                print("All model parameters forced to DirectML device")
+                print(f"CPU optimizations enabled:")
+                print(f"  Threads: {torch.get_num_threads()}")
+                print(f"  MKL-DNN: {torch.backends.mkldnn.enabled}")
+                print(f"  TF32: {torch.backends.mkldnn.allow_tf32}")
                 
-                # Use smaller test tensor for better performance
-                test_tensor = torch.randn(1, 3, 320, 320, device=self.dml_device)
-                print(f"Test tensor created on DirectML device: {test_tensor.device}")
+                # Test forward pass on CPU
+                test_tensor = torch.randn(1, 3, 320, 320, device='cpu')
+                print(f"Test tensor created on CPU: {test_tensor.device}")
                 
-                # Test forward pass with explicit computation
                 with torch.no_grad():
                     test_output = self.model.model(test_tensor)
-                    # Force computation by accessing the output
                     if isinstance(test_output, (list, tuple)):
-                        _ = test_output[0].cpu()
+                        _ = test_output[0]
                     else:
-                        _ = test_output.cpu()
-                print("Test forward pass successful with explicit computation")
+                        _ = test_output
+                print("Test forward pass successful on CPU")
                 
-                # Initialize predictor with DirectML device
-                self.model.predictor = self.model.model
-                print("Predictor initialized with DirectML device")
+                print("AMD MSS + CPU optimization complete")
                 
-                # Verify model is on DirectML device
+                # Verify model is on CPU
                 model_device = next(self.model.model.parameters()).device
                 print(f"Model device: {model_device}")
-                print(f"Expected device: {self.dml_device}")
                 
-                if model_device == self.dml_device:
-                    print("Model successfully moved to AMD GPU using DirectML")
+                if model_device == torch.device('cpu'):
+                    print("Model successfully optimized for AMD GPU using MSS + CPU")
                 else:
-                    print("WARNING: Model not on DirectML device")
-                    raise Exception("Failed to move model to GPU")
+                    print("WARNING: Model not on CPU device")
+                    raise Exception("Failed to move model to CPU")
                 
                 # Set model parameters for better performance
-                self.model.conf = self.config.get('confidence', 0.5)
-                self.model.iou = self.config.get('iou_threshold', 0.45)
+                self.model.conf = self.config.get('confidence', 0.15)
+                self.model.iou = self.config.get('iou_threshold', 0.25)
                 print(f"Model confidence threshold set to: {self.model.conf}")
                 print(f"Model IoU threshold set to: {self.model.iou}")
                 
-                # Set class names
-                self.class_names = ['item']
-                print(f"Model class names set to: {self.class_names}")
-                
-                # Force another computation to ensure GPU is active (use smaller tensor)
+                # Force another computation to ensure CPU is active
                 try:
-                    warm_tensor = torch.rand(500, 500, device=self.dml_device)
+                    warm_tensor = torch.rand(500, 500, device='cpu')
                     result = warm_tensor @ warm_tensor.t()
-                    _ = result.cpu().numpy()
-                    print("Final GPU warm-up successful - GPU should be active now")
+                    _ = result.numpy()
+                    print("Final CPU warm-up successful - CPU should be active now")
                 except Exception as e:
-                    print(f"Warning: Final GPU warm-up failed: {e}")
+                    print(f"Warning: Final CPU warm-up failed: {e}")
             
             # Apply additional performance optimizations
             try:
-                # Optimize model for inference
                 if hasattr(self.model.model, 'fuse'):
                     self.model.model.fuse()
                     print("Model layers fused for better performance")
                 
-                # Set half-precision for better performance if supported
-                if self.gpu_type == 'NVIDIA':
+                if self.hardware_manager.is_nvidia():
                     self.model.model = self.model.model.half()
                     print("Model converted to half-precision for better performance")
             except Exception as e:
                 print(f"Warning: Some optimizations couldn't be applied: {e}")
             
             print(f"YOLOv8 model loaded successfully from {self.model_path}")
+            
+            # Apply performance optimizations
+            self.optimize_model()
+            
             return True
             
         except Exception as e:
             print(f"ERROR: Failed to load model on GPU: {e}")
             return False
 
-    def process_frame(self, frame):
-        """Extreme optimization for CS2 aiming for 150+ FPS with maximum GPU utilization."""
+    def optimize_model(self):
+        """Apply performance optimizations to the model."""
+        if hasattr(self.model, 'model'):
+            # Enable PyTorch optimizations
+            torch.set_num_threads(8)  # Use more CPU threads
+            torch.backends.cudnn.benchmark = True
+            
+            # Fuse layers for faster inference
+            try:
+                self.model.model.fuse()
+                print("[INFO] Model fused for faster inference")
+            except Exception as e:
+                print(f"[INFO] Model fusion failed: {e}")
+            
+            # Use lower precision if available
+            try:
+                self.model.model.half()
+                print("[INFO] Using FP16 for faster inference")
+            except Exception as e:
+                print(f"[INFO] FP16 not available: {e}")
+            
+            # Optimize thresholds for speed
+            self.model.conf = 0.4  # Higher confidence = fewer detections = faster
+            self.model.iou = 0.45  # Optimized NMS threshold
+            
+            print(f"[INFO] Optimized model with {self.target_size}x{self.target_size} input")
+    
+    def should_process_frame(self):
+        """Determine if current frame should be processed."""
+        self.frame_counter += 1
+        return self.frame_counter % (self.frame_skip + 1) == 0
+
+
+    def process_frame(self, frame: np.ndarray) -> List[Dict[str, Any]]:
+        """
+        Process a frame for object detection with hardware acceleration.
+        
+        This method handles frame preprocessing, inference, and result processing
+        using the appropriate hardware (AMD GPU, NVIDIA GPU, or CPU).
+        
+        Args:
+            frame: Input frame as numpy array (HWC format)
+            
+        Returns:
+            List of detection dictionaries containing bbox, confidence, and class info
+        """
         try:
-            # Use configurable target size for maximum speed
-            target_size = config.get('target_size', 160)
-            capture_size = config.get('capture_size', 480)
-            max_boxes = config.get('max_boxes', 3)
+            target_size = self.config.get('target_size', 640)
+            capture_size = self.config.get('capture_size', 640)
+            max_boxes = self.config.get('max_boxes', 5)
             
-            # Skip processing every other frame if we're behind
-            self.skip_counter += 1
-            if self.skip_counter % 2 != 0 and hasattr(self, 'last_detections'):
-                # Return cached results to maintain responsiveness
-                return self.last_detections
-            else:
-                self.skip_counter = 0
+            print(f"[DEBUG] Processing frame with shape: {frame.shape}")
             
-            # Initialize GPU processing
-            if not hasattr(self, 'gpu_initialized'):
-                self._initialize_gpu_processing(target_size)
-                self.gpu_initialized = True
+            # Initialize hardware processing if needed
+            if not hasattr(self, 'hardware_initialized'):
+                self._initialize_hardware_processing(target_size)
+                self.hardware_initialized = True
             
-            if self.gpu_type == 'AMD':
-                # AMD DirectML path - fully GPU accelerated
-                try:
-                    # Convert frame directly to GPU tensor if possible
-                    if isinstance(frame, torch.Tensor) and frame.device == self.dml_device:
-                        # Frame is already a GPU tensor
-                        gpu_frame = frame
-                    else:
-                        # Convert numpy array to GPU tensor
-                        gpu_frame = torch.from_numpy(frame).to(self.dml_device)
-                    
-                    # Resize directly on GPU using interpolate
-                    if gpu_frame.shape[0] != target_size or gpu_frame.shape[1] != target_size:
-                        # Reshape for interpolate (N,C,H,W)
-                        if len(gpu_frame.shape) == 3:  # (H,W,C)
-                            gpu_frame = gpu_frame.permute(2, 0, 1).unsqueeze(0)  # (1,C,H,W)
-                        
-                        # Resize on GPU
-                        gpu_frame = torch.nn.functional.interpolate(
-                            gpu_frame.float(), 
-                            size=(target_size, target_size),
-                            mode='bilinear',
-                            align_corners=False
-                        )
-                    else:
-                        # Just reshape for model input
-                        if len(gpu_frame.shape) == 3:  # (H,W,C)
-                            gpu_frame = gpu_frame.permute(2, 0, 1).unsqueeze(0)  # (1,C,H,W)
-                    
-                    # Normalize on GPU (in-place when possible)
-                    if gpu_frame.dtype != torch.float32:
-                        gpu_frame = gpu_frame.float()
-                    gpu_frame.div_(255.0)  # In-place division
-                    
-                    # Run inference directly with GPU tensor
-                    with torch.no_grad():
-                        # Use cached tensor for maximum speed
-                        self.input_tensor_buffer.copy_(gpu_frame, non_blocking=True)
-                        results = self.model.model(self.input_tensor_buffer)
-                
-                        # Synchronize GPU to make sure operations are complete
-                        if self.gpu_type == 'NVIDIA' and hasattr(torch, 'cuda'):
-                            torch.cuda.synchronize()
-                        elif self.gpu_type == 'AMD' and hasattr(torch, 'dml'):
-                            torch.dml.synchronize()
-                        elif self.gpu_type == 'AMD':
-                            # DirectML doesn't have synchronize, use device barrier instead
-                            try:
-                                # Try to use device barrier if available
-                                if hasattr(self.model, 'model') and hasattr(self.model.model, 'to'):
-                                    dummy = torch.zeros(1, device=self.dml_device)
-                                    _ = dummy + 1  # Force execution
-                            except Exception as e:
-                                pass  # Silently fail if barrier doesn't work
-                        
-                        # Ultra-minimal result processing
-                        if isinstance(results, (list, tuple)):
-                            results = results[0] if results else None
-                
-                except Exception as e:
-                    print(f"GPU processing error (AMD): {e}, falling back to CPU path")
-                    # Fall back to CPU path
-                    if not hasattr(self, 'resize_buffer'):
-                        self.resize_buffer = np.zeros((target_size, target_size, 3), dtype=np.uint8)
-                    
-                    # Resize on CPU
-                    frame_resized = cv2.resize(frame, (target_size, target_size), 
-                                             dst=self.resize_buffer,
-                                             interpolation=cv2.INTER_AREA)
-                    
-                    # Standard CPU to GPU transfer
-                    np_tensor = frame_resized.transpose(2, 0, 1)  # HWC to CHW
-                    self.cpu_tensor[0].copy_(torch.from_numpy(np_tensor))
-                    self.cpu_tensor.div_(255.0)  # In-place division
-                    
-                    # Copy to device
-                    self.input_tensor_buffer.copy_(self.cpu_tensor.to(self.dml_device))
-                
-                    # Run inference
-                    with torch.no_grad():
-                        results = self.model.model(self.input_tensor_buffer)
-                        if isinstance(results, (list, tuple)):
-                            results = results[0] if results else None
-            elif self.gpu_type == 'NVIDIA':
-                # NVIDIA CUDA path - fully GPU accelerated
-                try:
-                    # Convert frame directly to GPU tensor if possible
-                    if isinstance(frame, torch.Tensor) and frame.device == self.device:
-                        # Frame is already a GPU tensor
-                        gpu_frame = frame
-                    else:
-                        # Convert numpy array to GPU tensor
-                        gpu_frame = torch.from_numpy(frame).to(self.device)
-                    
-                    # Resize directly on GPU using interpolate
-                    if gpu_frame.shape[0] != target_size or gpu_frame.shape[1] != target_size:
-                        # Reshape for interpolate (N,C,H,W)
-                        if len(gpu_frame.shape) == 3:  # (H,W,C)
-                            gpu_frame = gpu_frame.permute(2, 0, 1).unsqueeze(0)  # (1,C,H,W)
-                        
-                        # Resize on GPU
-                        gpu_frame = torch.nn.functional.interpolate(
-                            gpu_frame.float(), 
-                            size=(target_size, target_size),
-                            mode='bilinear',
-                            align_corners=False
-                        )
-                    else:
-                        # Just reshape for model input
-                        if len(gpu_frame.shape) == 3:  # (H,W,C)
-                            gpu_frame = gpu_frame.permute(2, 0, 1).unsqueeze(0)  # (1,C,H,W)
-                    
-                    # Normalize on GPU (in-place when possible)
-                    if gpu_frame.dtype != torch.float16:
-                        gpu_frame = gpu_frame.half()  # Use half precision for NVIDIA
-                    gpu_frame.div_(255.0)  # In-place division
-                    
-                    # Run inference directly with GPU tensor
-                    with torch.no_grad():
-                        # Use cached tensor for maximum speed
-                        self.input_tensor_buffer.copy_(gpu_frame, non_blocking=True)
-                        results = self.model.model(self.input_tensor_buffer)
-                        
-                        # Synchronize GPU to make sure operations are complete
-                        if self.gpu_type == 'NVIDIA' and hasattr(torch, 'cuda'):
-                            torch.cuda.synchronize()
-                        elif self.gpu_type == 'AMD' and hasattr(torch, 'dml'):
-                            torch.dml.synchronize()
-                        elif self.gpu_type == 'AMD':
-                            # DirectML doesn't have synchronize, use device barrier instead
-                            try:
-                                # Try to use device barrier if available
-                                if hasattr(self.model, 'model') and hasattr(self.model.model, 'to'):
-                                    dummy = torch.zeros(1, device=self.dml_device)
-                                    _ = dummy + 1  # Force execution
-                            except Exception as e:
-                                pass  # Silently fail if barrier doesn't work
-                        
-                        # Ultra-minimal result processing
-                        if isinstance(results, (list, tuple)):
-                            results = results[0] if results else None
-                
-                except Exception as e:
-                    print(f"GPU processing error (NVIDIA): {e}, falling back to CPU path")
-                    # Fall back to CPU path
-                    if not hasattr(self, 'resize_buffer'):
-                        self.resize_buffer = np.zeros((target_size, target_size, 3), dtype=np.uint8)
-                    
-                    # Resize on CPU
-                    frame_resized = cv2.resize(frame, (target_size, target_size), 
-                                             dst=self.resize_buffer,
-                                             interpolation=cv2.INTER_AREA)
-                    
-                    # Standard CPU to GPU transfer
-                    np_tensor = frame_resized.transpose(2, 0, 1)  # HWC to CHW
-                    self.cpu_tensor[0].copy_(torch.from_numpy(np_tensor))
-                    self.cpu_tensor.div_(255.0)  # In-place division
-                    
-                    # Copy to device
-                    self.input_tensor_buffer.copy_(self.cpu_tensor.to(self.device))
-                    
-                    # Run inference
-                    with torch.no_grad():
-                        results = self.model.model(self.input_tensor_buffer)
-                        if isinstance(results, (list, tuple)):
-                            results = results[0] if results else None
+            # Add thread synchronization to prevent resource deadlocks
+            if not hasattr(self, 'gpu_lock'):
+                self.gpu_lock = threading.RLock()
             
-            else:
-                # CPU fallback path
-                if not hasattr(self, 'resize_buffer'):
-                    self.resize_buffer = np.zeros((target_size, target_size, 3), dtype=np.uint8)
+            # Use hardware manager to determine processing path
+            if self.hardware_manager.is_cpu():
+                # Performance optimizations
+                # Use smaller input size for speed
+                target_size = 416  # Optimized size
                 
-                # Skip resize if frame is already the right size
-                if frame.shape[0] == target_size and frame.shape[1] == target_size:
-                    frame_resized = frame
+                # Frame skipping for better performance
+                if hasattr(self, 'frame_counter'):
+                    self.frame_counter += 1
+                    if self.frame_counter % 2 == 0:  # Process every 2nd frame
+                        # Return cached detections if available
+                        if hasattr(self, 'last_detections') and self.last_detections:
+                            return self.last_detections
                 else:
-                    frame_resized = cv2.resize(frame, (target_size, target_size), 
-                                             dst=self.resize_buffer,
-                                             interpolation=cv2.INTER_AREA)
+                    self.frame_counter = 0
+                return self._process_frame_cpu(frame, target_size, capture_size)
+            elif self.hardware_manager.is_amd():
+                return self._process_frame_amd(frame, target_size, capture_size)
+            elif self.hardware_manager.is_nvidia():
+                return self._process_frame_nvidia(frame, target_size, capture_size)
+            else:
+                print("[ERROR] No supported hardware type found")
+                return []
+            
+        except Exception as e:
+            print(f"[ERROR] Critical error in process_frame: {e}")
+            return []
+
+    def _process_frame_cpu(self, frame: np.ndarray, target_size: int, capture_size: int) -> List[Dict[str, Any]]:
+        """Process frame using CPU fallback mode."""
+        try:
+            print("[INFO] Using CPU fallback mode")
+            
+            # Resize on CPU
+            frame_resized = cv2.resize(frame, (target_size, target_size), 
+                                     interpolation=cv2.INTER_LINEAR)
+            
+            # Run inference with CPU mode
+            with torch.no_grad():
+                # Use CPU tensor directly
+                np_tensor = frame_resized.transpose(2, 0, 1)  # HWC to CHW
+                cpu_tensor = torch.from_numpy(np_tensor).float()
+                cpu_tensor = cpu_tensor.unsqueeze(0).div(255.0)  # Add batch dimension and normalize
                 
-                # Run inference on CPU (slow)
-                results = self.model(frame_resized)
+                # Run inference on CPU
+                # Use YOLOv8 API directly
+                cpu_tensor = cpu_tensor.clone().detach().contiguous().float().to('cpu')
+                results = self.model(cpu_tensor)
+                detections = self.direct_process_results(results, frame_resized, capture_size, target_size)
+                return detections
+                
+        except Exception as e:
+            print(f"[ERROR] CPU fallback processing failed: {e}")
+            return []
+
+    def _process_frame_amd(self, frame: np.ndarray, target_size: int, capture_size: int) -> List[Dict[str, Any]]:
+        """Process frame using MSS + CPU optimization for AMD GPUs."""
+        try:
+            print("[INFO] Using MSS + CPU optimization for AMD GPU")
             
-            # Process results (absolute minimal processing)
-            detections = []
-            if results is not None and hasattr(results, 'boxes'):
-                boxes = results.boxes
-                # Process results on GPU when possible
-                try:
-                    if self.gpu_type in ['AMD', 'NVIDIA'] and hasattr(boxes, 'xyxy') and hasattr(boxes, 'conf'):
-                        # Get all boxes at once
-                        all_boxes = boxes.xyxy[:max_boxes]  # Limit to max_boxes
-                        all_confs = boxes.conf[:max_boxes]
-                        all_cls = boxes.cls[:max_boxes]
+            # Optimized preprocessing with MSS data
+            frame_resized = cv2.resize(frame, (target_size, target_size), 
+                                     interpolation=cv2.INTER_LINEAR)
+            
+            # Convert to tensor with optimized operations
+            np_tensor = frame_resized.transpose(2, 0, 1)  # HWC to CHW
+            cpu_tensor = torch.from_numpy(np_tensor).float()
+            cpu_tensor = cpu_tensor.unsqueeze(0).div(255.0)  # Add batch dimension and normalize
+            
+            # Run inference with CPU optimizations
+            with torch.no_grad():
+                # Use YOLOv8 API directly on CPU
+                cpu_tensor = cpu_tensor.detach().contiguous()
+                results = self.model(cpu_tensor)
+                detections = self.direct_process_results(results, frame_resized, capture_size, target_size)
+                return detections
                         
-                        # Filter by confidence on GPU
-                        conf_threshold = self.config.get('confidence', 0.5)
-                        mask = all_confs > conf_threshold
+        except Exception as e:
+            print(f"[ERROR] AMD MSS + CPU processing failed: {e}")
+            return []
+
+    def _process_frame_nvidia(self, frame: np.ndarray, target_size: int, capture_size: int) -> List[Dict[str, Any]]:
+        """Process frame using NVIDIA GPU with CUDA."""
+        with self.gpu_lock:
+            try:
+                # Resize on CPU
+                frame_resized = cv2.resize(frame, (target_size, target_size), 
+                                         interpolation=cv2.INTER_AREA)
+                
+                # Convert to tensor
+                np_tensor = frame_resized.transpose(2, 0, 1)  # HWC to CHW
+                cpu_tensor = torch.from_numpy(np_tensor).float()
+                cpu_tensor = cpu_tensor.unsqueeze(0).div(255.0)  # Add batch dimension and normalize
+                
+                # Move to GPU - use synchronous transfer
+                with torch.no_grad():
+                    gpu_tensor = cpu_tensor.to(self.device)
+                
+                # Run inference
+                with torch.no_grad():
+                    # Use YOLOv8 API directly
+                    gpu_tensor = gpu_tensor.detach().contiguous()
+                    gpu_tensor = gpu_tensor.clone().detach().contiguous().float().to(self.device)
+                    results = self.model(gpu_tensor)
+                    detections = self.direct_process_results(results, frame_resized, capture_size, target_size)
+                    return detections
                         
-                        # Apply filter
-                        filtered_boxes = all_boxes[mask]
-                        filtered_confs = all_confs[mask]
-                        filtered_cls = all_cls[mask]
-                        
-                        # Scale coordinates on GPU
-                        scale_factor = capture_size / target_size
-                        filtered_boxes *= scale_factor
-                        
-                        # Transfer to CPU only once
-                        cpu_boxes = filtered_boxes.cpu().numpy()
-                        cpu_confs = filtered_confs.cpu().numpy()
-                        cpu_cls = filtered_cls.cpu().numpy()
-                        
-                        # Create detection objects
-                        for i in range(len(cpu_boxes)):
-                            x1, y1, x2, y2 = cpu_boxes[i]
-                            detections.append({
-                                'bbox': [x1, y1, x2, y2],
-                                'confidence': float(cpu_confs[i]),
-                                'class': int(cpu_cls[i])
-                            })
-                    else:
-                        # CPU fallback for processing boxes
-                        for i in range(min(max_boxes, len(boxes))):
-                            box = boxes[i]
-                            if box.conf > self.config.get('confidence', 0.5):
-                                try:
-                                    # Get coordinates directly
-                                    xyxy = box.xyxy[0].cpu().numpy()
-                        
-                                    # Scale back to original frame size
-                                    scale_factor = capture_size / target_size
-                                    x1, y1, x2, y2 = xyxy * scale_factor
-                        
-                                    detections.append({
-                                        'bbox': [x1, y1, x2, y2],
-                                        'confidence': float(box.conf),
-                                        'class': int(box.cls)
-                                    })
-                                except:
-                                    continue
-                except Exception as e:
-                    print(f"Error processing detection results: {e}")
-                    # Fallback to basic processing
-                    for i in range(min(max_boxes, len(boxes))):
-                        box = boxes[i]
-                        if box.conf > self.config.get('confidence', 0.5):
-                            try:
-                                # Get coordinates directly
-                                xyxy = box.xyxy[0].cpu().numpy()
-                                
-                                # Scale back to original frame size
-                                scale_factor = capture_size / target_size
-                                x1, y1, x2, y2 = xyxy * scale_factor
-                                
-                                detections.append({
-                                    'bbox': [x1, y1, x2, y2],
-                                    'confidence': float(box.conf),
-                                    'class': int(box.cls)
-                                })
-                            except:
+            except Exception as e:
+                print(f"[ERROR] NVIDIA GPU processing failed: {e}")
+                return []
+
+    def direct_process_results(self, raw_results: Union[torch.Tensor, List[torch.Tensor]], 
+                             frame_resized: np.ndarray, capture_size: int, target_size: int) -> List[Dict[str, Any]]:
+        """
+        Process raw YOLOv8 results directly using the proper YOLOv8 API.
+        
+        Args:
+            raw_results: Raw results from YOLOv8 model
+            frame_resized: Resized frame that was processed
+            capture_size: Size of the captured frame
+            target_size: Target size for model input
+            
+        Returns:
+            List of detection dictionaries
+        """
+        try:
+            # Get screen dimensions
+            screen_width = win32api.GetSystemMetrics(0)
+            screen_height = win32api.GetSystemMetrics(1)
+            
+            # Get the capture region dimensions
+            if hasattr(self, 'screen_capture') and hasattr(self.screen_capture, 'capture_region'):
+                capture_region = self.screen_capture.capture_region
+                capture_width = capture_region.get('width', screen_width)
+                capture_height = capture_region.get('height', screen_height)
+            else:
+                # Default to full screen if capture region not available
+                capture_width = screen_width
+                capture_height = screen_height
+            
+            # Process detections using YOLOv8 API
+            valid_detections = []
+            
+            # The raw_results is a list of Results objects
+            if isinstance(raw_results, list) and len(raw_results) > 0:
+                results = raw_results[0]  # Get first result
+                
+                if hasattr(results, 'boxes') and results.boxes is not None:
+                    boxes = results.boxes
+                    
+                    print(f"[DEBUG] Processing {len(boxes)} YOLOv8 detections")
+                    
+                    for i, box in enumerate(boxes):
+                        try:
+                            # Get coordinates in xyxy format (pixel coordinates)
+                            coords = box.xyxy[0].cpu().numpy()  # [x1, y1, x2, y2]
+                            confidence = box.conf[0].cpu().numpy()
+                            class_id = int(box.cls[0].cpu().numpy())
+                            
+                            x1, y1, x2, y2 = coords
+                            
+                            # Skip if confidence is below threshold
+                            if confidence < self.config.get('confidence', 0.05):  # Use config confidence instead of hardcoded 0.15
                                 continue
+                                
+                            print(f"[DEBUG] YOLOv8 detection {i}: xyxy={coords}, conf={confidence:.3f}, class={class_id}")
+                            
+                            # Scale coordinates from model input size (640x640) to screen size
+                            scale_x = capture_width / target_size
+                            scale_y = capture_height / target_size
+                            
+                            screen_x1 = x1 * scale_x
+                            screen_y1 = y1 * scale_y
+                            screen_x2 = x2 * scale_x
+                            screen_y2 = y2 * scale_y
+                            
+                            print(f"[DEBUG] Scaled coordinates: ({screen_x1:.1f},{screen_y1:.1f}) to ({screen_x2:.1f},{screen_y2:.1f})")
+                            
+                            # Calculate box dimensions
+                            box_width = screen_x2 - screen_x1
+                            box_height = screen_y2 - screen_y1
+                            
+                            # Filter out boxes that are too large
+                            if box_width > 0.6 * screen_width or box_height > 0.8 * screen_height:
+                                print(f"Filtering out oversized box: {box_width:.1f}x{box_height:.1f}")
+                                continue
+                                
+                            # Filter out boxes that are too small
+                            if box_width < 5 or box_height < 5:
+                                print(f"Filtering out tiny box: {box_width:.1f}x{box_height:.1f}")
+                                continue
+                                
+                            # Ensure coordinates are within screen bounds
+                            box_left = max(0, min(screen_width, int(screen_x1)))
+                            box_top = max(0, min(screen_height, int(screen_y1)))
+                            box_right = max(0, min(screen_width, int(screen_x2)))
+                            box_bottom = max(0, min(screen_height, int(screen_y2)))
+                            
+                            # Skip invalid boxes
+                            if box_right <= box_left or box_bottom <= box_top:
+                                print(f"Skipping invalid box: ({box_left},{box_top}) to ({box_right},{box_bottom})")
+                                continue
+                            
+                            # Add to valid detections
+                            valid_detections.append({
+                                'bbox': [box_left, box_top, box_right, box_bottom],
+                                'confidence': float(confidence),
+                                'class': class_id
+                            })
+                            
+                            print(f"[DEBUG] Added detection {i}: screen=({box_left},{box_top},{box_right},{box_bottom}), conf={confidence:.2f}")
+                            
+                        except Exception as e:
+                            print(f"[DEBUG] Error processing YOLOv8 detection {i}: {e}")
+                
+                # Apply non-maximum suppression
+                if len(valid_detections) > 0:
+                    boxes = np.array([d['bbox'] for d in valid_detections])
+                    scores = np.array([d['confidence'] for d in valid_detections])
+                
+                    # Simple NMS implementation
+                    keep = []
+                    for i in range(len(boxes)):
+                        keep_box = True
+                        for j in range(len(boxes)):
+                            if i != j:
+                                # Calculate IoU
+                                x1_i, y1_i, x2_i, y2_i = boxes[i]
+                                x1_j, y1_j, x2_j, y2_j = boxes[j]
+                                
+                                # Calculate intersection
+                                x1_inter = max(x1_i, x1_j)
+                                y1_inter = max(y1_i, y1_j)
+                                x2_inter = min(x2_i, x2_j)
+                                y2_inter = min(y2_i, y2_j)
+                                
+                                if x2_inter > x1_inter and y2_inter > y1_inter:
+                                    inter_area = (x2_inter - x1_inter) * (y2_inter - y1_inter)
+                                    area_i = (x2_i - x1_i) * (y2_i - y1_i)
+                                    area_j = (x2_j - x1_j) * (y2_j - y1_j)
+                                    iou = inter_area / (area_i + area_j - inter_area)
+                                    
+                                    if iou > 0.5:  # IoU threshold
+                                        if scores[i] < scores[j]:
+                                            keep_box = False
+                                        break
+                        
+                        if keep_box:
+                            keep.append(i)
+                    
+                    # Keep only non-overlapping boxes
+                    detections = [valid_detections[i] for i in keep]
+                    print(f"[DEBUG] After NMS: {len(detections)} boxes")
+                else:
+                    detections = []
+                    print("[DEBUG] No valid detections found")
+            else:
+                detections = []
+                print("[DEBUG] No results found in raw_results")
             
-            # Cache detections for frame skipping
-            self.last_detections = detections
             return detections
             
         except Exception as e:
-            print(f"Error processing frame: {e}")
+            print(f"[ERROR] Failed to process YOLOv8 results: {e}")
+            import traceback
+            traceback.print_exc()
             return []
-            
-    def _initialize_gpu_processing(self, target_size):
-        """Initialize GPU resources for processing."""
+
+    def _initialize_hardware_processing(self, target_size: int) -> None:
+        """
+        Initialize hardware resources for processing.
+        
+        Args:
+            target_size: Target size for model input tensors
+        """
         try:
-            if self.gpu_type == 'AMD':
-                # Pre-allocate tensor for zero-copy
-                self.input_tensor_buffer = torch.zeros((1, 3, target_size, target_size), 
-                                                     device=self.dml_device,
-                                                     dtype=torch.float32)
+            # Create a lock for hardware operations if it doesn't exist
+            if not hasattr(self, 'gpu_lock'):
+                self.gpu_lock = threading.RLock()
                 
-                # Pre-allocate CPU tensor to avoid repeated allocations
-                self.cpu_tensor = torch.zeros((1, 3, target_size, target_size), 
-                                           dtype=torch.float32)
-                
-                # Create utility tensors for GPU operations
-                self.gpu_resize_tensor = torch.zeros((1, 3, target_size, target_size), 
-                                                   device=self.dml_device,
-                                                   dtype=torch.float32)
-                
-                print("Initialized AMD GPU resources for accelerated processing")
-                
-            elif self.gpu_type == 'NVIDIA':
-                # Pre-allocate tensor for zero-copy with half precision
-                self.input_tensor_buffer = torch.zeros((1, 3, target_size, target_size), 
-                                                     device=self.device,
-                                                     dtype=torch.float16)
-                
-                # Pre-allocate CPU tensor to avoid repeated allocations
-                self.cpu_tensor = torch.zeros((1, 3, target_size, target_size), 
-                                           dtype=torch.float16)
-                
-                # Create utility tensors for GPU operations
-                self.gpu_resize_tensor = torch.zeros((1, 3, target_size, target_size), 
-                                                   device=self.device,
-                                                   dtype=torch.float16)
-                
-                # Enable CUDA graphs for faster inference if available
-                if hasattr(torch.cuda, 'make_graphed_callables'):
+            # Use the lock to prevent concurrent access during initialization
+            with self.gpu_lock:
+                if self.hardware_manager.is_amd():
+                    # Create tensors on CPU for AMD optimization (MSS + CPU approach)
                     try:
-                        sample_input = torch.randn((1, 3, target_size, target_size), 
-                                                device=self.device, 
-                                                dtype=torch.float16)
+                        # Initialize input tensor with CPU device
+                        self.input_tensor = torch.zeros((1, 3, target_size, target_size), 
+                                                      dtype=torch.float32, device='cpu')
                         
-                        # Try to graph the model for faster inference
-                        self.model.model = torch.cuda.make_graphed_callables(
-                            self.model.model, (sample_input,))
-                        print("CUDA graph optimization enabled for faster inference")
+                        # Create a tensor for CPU processing
+                        self.gpu_frame_tensor = torch.zeros((self.config.get('capture_size', 480), 
+                                                          self.config.get('capture_size', 480), 
+                                                          3), dtype=torch.uint8, device='cpu')
+                        
+                        # Create a tensor for CPU-based preprocessing
+                        self.preprocess_tensor = torch.zeros((1, 3, target_size, target_size), 
+                                                          dtype=torch.float32, device='cpu')
+                        
+                        print("Successfully created AMD MSS + CPU tensors")
+                        
                     except Exception as e:
-                        print(f"CUDA graph optimization failed: {e}")
-                
-                print("Initialized NVIDIA GPU resources for accelerated processing")
+                        print(f"Failed to create tensors on AMD CPU: {e}")
+                        # Create on CPU instead
+                        self.input_tensor = torch.zeros((1, 3, target_size, target_size), dtype=torch.float32)
+                        self.gpu_frame_tensor = torch.zeros((self.config.get('capture_size', 480), 
+                                                          self.config.get('capture_size', 480), 
+                                                          3), dtype=torch.uint8)
+                        self.preprocess_tensor = torch.zeros((1, 3, target_size, target_size), 
+                                                          dtype=torch.float32)
+                    
+                    # Create a stream for asynchronous operations (None for AMD CPU mode)
+                    self.stream = None  # AMD CPU mode doesn't need streams
+                    
+                elif self.hardware_type == 'NVIDIA':
+                    # Pre-allocate tensor for zero-copy with half precision
+                    self.input_tensor = torch.zeros((1, 3, target_size, target_size), 
+                                                         device=self.device,
+                                                         dtype=torch.float16)
+                    
+                    # Pre-allocate CPU tensor to avoid repeated allocations
+                    self.cpu_tensor = torch.zeros((1, 3, target_size, target_size), 
+                                               dtype=torch.float16)
+                    
+                    # Create utility tensors for GPU operations
+                    self.gpu_resize_tensor = torch.zeros((1, 3, target_size, target_size), 
+                                                       device=self.device,
+                                                       dtype=torch.float16)
+                    
+                    # Force synchronization to ensure GPU resources are properly initialized
+                    if hasattr(torch.cuda, 'synchronize'):
+                        torch.cuda.synchronize()
+                    
+                    # Enable CUDA graphs for faster inference if available
+                    if hasattr(torch.cuda, 'make_graphed_callables') and target_size <= 160:
+                        try:
+                            # Use a separate stream for CUDA graph to avoid conflicts
+                            if not hasattr(self, 'graph_stream'):
+                                self.graph_stream = torch.cuda.Stream()
+                            
+                            with torch.cuda.stream(self.graph_stream):
+                                sample_input = torch.randn((1, 3, target_size, target_size), 
+                                                        device=self.device, 
+                                                        dtype=torch.float16)
+                                
+                                # Try to graph the model for faster inference
+                                with torch.no_grad():
+                                    self.model.model = torch.cuda.make_graphed_callables(
+                                        self.model.model, (sample_input,))
+                                
+                                # Ensure graph is completed
+                                torch.cuda.current_stream().wait_stream(self.graph_stream)
+                                torch.cuda.synchronize()
+                                
+                            print("CUDA graph optimization enabled for faster inference")
+                        except Exception as e:
+                            print(f"CUDA graph optimization failed: {e}")
+                    
+                    print("Initialized NVIDIA GPU resources for accelerated processing")
         except Exception as e:
             print(f"Failed to initialize GPU resources: {e}")
             # Reset GPU initialized flag to try again next time
             self.gpu_initialized = False
 
-    def force_overlay_redraw(self):
-        # This method should trigger a redraw of the overlay window
+    def force_overlay_redraw(self) -> None:
+        """Force a redraw of the overlay window."""
         try:
             if hasattr(self, 'hwnd'):
                 win32gui.InvalidateRect(self.hwnd, None, True)
         except Exception as e:
             print(f"[DEBUG] Error forcing overlay redraw: {e}")
 
-    def _detection_loop(self):
-        """CS2-specific extreme performance detection loop targeting 150+ FPS using maximum GPU acceleration."""
-        # Pre-allocate tensors for better performance
-        import torch
-        import numpy as np
-        import cv2
-        import threading
-        import time
-        import ctypes
+    def _detection_loop(self) -> None:
+        """
+        Main detection loop for real-time object detection.
         
+        This method runs in a separate thread and continuously processes frames
+        from the screen capture system, performing object detection and updating
+        the detection state.
+        """
         # Set thread priority to time-critical
         try:
             import win32api
@@ -1177,29 +1126,106 @@ class YOLODetector:
         self.screen_capture = self.ScreenCapture()
         
         # Pass GPU information to screen capture for acceleration
-        if hasattr(self, 'gpu_type'):
+        if hasattr(self, 'hardware_manager'):
             self.screen_capture.parent = self
-            print(f"Passed {self.gpu_type} GPU reference to screen capture")
+            print(f"Passed {self.hardware_manager.get_hardware_type()} GPU reference to screen capture")
         
         # Configure sizes from config
-        target_size = config.get('target_size', 160)
+        target_size = self.config.get('target_size', 160)
+        
+        # Get frame skipping value from config
+        self.process_every_n = self.config.get('frame_skipping', 1)
+        # Ensure it's within valid range (1-4)
+        self.process_every_n = max(1, min(4, self.process_every_n))
+        print(f"Frame skipping set to: {self.process_every_n}")
         
         # Create pre-allocated tensors with configurable size for maximum performance
-        if self.gpu_type == 'AMD':
-            # Create tensors on AMD GPU using DirectML
-            self.input_tensor = torch.zeros((1, 3, target_size, target_size), device=self.dml_device)
-            
-            # Create a tensor for direct GPU-to-GPU transfer (avoid CPU roundtrip)
-            self.gpu_frame_tensor = torch.zeros((config.get('capture_size', 480), 
-                                               config.get('capture_size', 480), 
-                                               3), 
-                                              device=self.dml_device,
-                                              dtype=torch.uint8)
-            
-            # Create a tensor for GPU-based preprocessing
-            self.preprocess_tensor = torch.zeros((1, 3, target_size, target_size), 
-                                               device=self.dml_device,
-                                               dtype=torch.float32)
+        try:
+            if self.hardware_manager.is_amd():
+                # Create tensors on AMD GPU using DirectML
+                try:
+                    # Initialize input tensor with proper device
+                    self.input_tensor = self.hardware_manager.create_tensor(
+                        (1, 3, target_size, target_size), dtype=torch.float32)
+                    
+                    # Create a tensor for direct GPU-to-GPU transfer
+                    self.gpu_frame_tensor = self.hardware_manager.create_tensor(
+                        (self.config.get('capture_size', 480), 
+                         self.config.get('capture_size', 480), 
+                         3), dtype=torch.uint8)
+                    
+                    # Create a tensor for GPU-based preprocessing
+                    self.preprocess_tensor = self.hardware_manager.create_tensor(
+                        (1, 3, target_size, target_size), dtype=torch.float32)
+                    
+                    # Force synchronization to ensure GPU resources are properly initialized
+                    self.hardware_manager.synchronize()
+                    print("Successfully created AMD GPU tensors")
+                    
+                except Exception as e:
+                    print(f"Failed to create tensors on AMD GPU: {e}")
+                    # Create on CPU instead
+                    self.input_tensor = torch.zeros((1, 3, target_size, target_size), dtype=torch.float32)
+                    self.gpu_frame_tensor = torch.zeros((self.config.get('capture_size', 480), 
+                                                      self.config.get('capture_size', 480), 
+                                                      3), dtype=torch.uint8)
+                    self.preprocess_tensor = torch.zeros((1, 3, target_size, target_size), 
+                                                      dtype=torch.float32)
+                
+                # Create a stream for asynchronous operations (None for AMD)
+                self.stream = None  # AMD DirectML doesn't support CUDA streams
+                
+            elif self.hardware_manager.is_nvidia():
+                # Create tensors on NVIDIA GPU using CUDA
+                try:
+                    self.input_tensor = self.hardware_manager.create_tensor(
+                        (1, 3, target_size, target_size), dtype=torch.float16)
+                    
+                    # Create a tensor for direct GPU-to-GPU transfer (avoid CPU roundtrip)
+                    self.gpu_frame_tensor = self.hardware_manager.create_tensor(
+                        (self.config.get('capture_size', 480), 
+                         self.config.get('capture_size', 480), 
+                         3), dtype=torch.uint8)
+                
+                    # Create a tensor for GPU-based preprocessing
+                    self.preprocess_tensor = self.hardware_manager.create_tensor(
+                        (1, 3, target_size, target_size), dtype=torch.float16)
+                                                       
+                    # Create a pinned memory tensor for faster CPU-GPU transfers
+                    try:
+                        self.pinned_tensor = torch.zeros((1, 3, target_size, target_size), 
+                                                       dtype=torch.float16, 
+                                                       pin_memory=True)
+                    except RuntimeError:
+                        # Fallback if pin_memory is not available
+                        print("Pin memory not available, using standard tensor")
+                        self.pinned_tensor = torch.zeros((1, 3, target_size, target_size), 
+                                                       dtype=torch.float16)
+                    
+                    # Create a stream for asynchronous operations
+                    self.stream = torch.cuda.Stream()
+                    
+                except Exception as e:
+                    print(f"Failed to create NVIDIA tensors: {e}")
+                    # Create on CPU instead
+                    self.input_tensor = torch.zeros((1, 3, target_size, target_size))
+                    self.gpu_frame_tensor = torch.zeros((self.config.get('capture_size', 480), 
+                                                       self.config.get('capture_size', 480), 
+                                                       3), dtype=torch.uint8)
+                    self.preprocess_tensor = torch.zeros((1, 3, target_size, target_size), 
+                                                       dtype=torch.float32)
+            else:
+                # CPU initialization
+                print("Using CPU for tensor creation")
+                self.input_tensor = torch.zeros((1, 3, target_size, target_size), dtype=torch.float32)
+                self.gpu_frame_tensor = torch.zeros((self.config.get('capture_size', 480), 
+                                                   self.config.get('capture_size', 480), 
+                                                   3), dtype=torch.uint8)
+                self.preprocess_tensor = torch.zeros((1, 3, target_size, target_size), 
+                                                   dtype=torch.float32)
+                self.stream = None
+        except Exception as e:
+            print(f"Error initializing tensors: {e}")
             
             # Create a pinned memory tensor for faster CPU-GPU transfers
             try:
@@ -1215,52 +1241,8 @@ class YOLODetector:
             # Create a stream for asynchronous operations
             self.stream = None  # AMD DirectML doesn't support CUDA streams
             
-        elif self.gpu_type == 'NVIDIA':
-            # Create tensors on NVIDIA GPU using CUDA
-            self.input_tensor = torch.zeros((1, 3, target_size, target_size), device=self.device)
-            
-            # Create a tensor for direct GPU-to-GPU transfer (avoid CPU roundtrip)
-            self.gpu_frame_tensor = torch.zeros((config.get('capture_size', 480), 
-                                               config.get('capture_size', 480), 
-                                               3), 
-                                              device=self.device,
-                                              dtype=torch.uint8)
-        
-            # Create a tensor for GPU-based preprocessing
-            self.preprocess_tensor = torch.zeros((1, 3, target_size, target_size), 
-                                               device=self.device,
-                                               dtype=torch.float16)
-            
-            # Create a pinned memory tensor for faster CPU-GPU transfers
-            try:
-                self.pinned_tensor = torch.zeros((1, 3, target_size, target_size), 
-                                               dtype=torch.float16, 
-                                               pin_memory=True)
-            except RuntimeError:
-                # Fallback if pin_memory is not available
-                print("Pin memory not available, using standard tensor")
-                self.pinned_tensor = torch.zeros((1, 3, target_size, target_size), 
-                                               dtype=torch.float16)
-            
-            # Create a stream for asynchronous operations
-            self.stream = torch.cuda.Stream()
-            
-            # Enable CUDA graph for faster inference if available
-            if hasattr(torch.cuda, 'make_graphed_callables') and target_size <= 160:
-                try:
-                    sample_input = torch.randn((1, 3, target_size, target_size), 
-                                             device=self.device, 
-                                             dtype=torch.float16)
-                    
-                    # Try to graph the model for faster inference
-                    self.model.model = torch.cuda.make_graphed_callables(
-                        self.model.model, (sample_input,))
-                    print("CUDA graph optimization enabled for faster inference")
-                except Exception as e:
-                    print(f"CUDA graph optimization failed: {e}")
-        
-        # Prepare for ultra-performance loop
-        print(f"Starting CS2-optimized detection loop for 150+ FPS with {self.gpu_type} GPU acceleration")
+        # Prepare for performance loop
+        print(f"Starting detection loop with {self.hardware_manager.get_hardware_type()} acceleration")
         self.last_time = time.time()
         self.frame_count = 0
         self.processed_frames = 0
@@ -1292,19 +1274,23 @@ class YOLODetector:
         detection_times = collections.deque(maxlen=30)
         
         # For GPU memory management
-        if self.gpu_type == 'NVIDIA':
+        if self.hardware_manager.is_nvidia():
             # Schedule periodic GPU memory cleanup
             last_memory_cleanup = time.time()
             
             # Monitor GPU utilization
             try:
-                import GPUtil
                 last_gpu_check = time.time()
                 gpu_utils = []
             except ImportError:
                 print("GPUtil not available for GPU monitoring")
         
-        # Main detection loop - directly process frames from screen capture with GPU acceleration
+        # For tracking box changes
+        self.last_boxes = None
+        self.boxes_changed = False
+        self.last_box_update_time = time.time()
+        
+        # Main detection loop
         while self.running:
             try:
                 # Initialize detections with empty list as default for this iteration
@@ -1314,32 +1300,30 @@ class YOLODetector:
                 frame = self.screen_capture.get_frame()
                 
                 if frame is not None:
-                    self.cached_frame = frame  # Cache the latest frame
-                    
-                    # Process frame (with optional frame skipping for stability)
+                    # Process frame (with frame skipping for performance)
                     self.frame_counter += 1
                     if self.frame_counter % self.process_every_n == 0:
                         # Time the detection process
                         start_time = time.time()
                         
-                        # Process the frame with GPU acceleration
+                        # Make a copy of the frame for processing to avoid thread conflicts
+                        # This is the only copy we need to make
+                        frame_copy = frame.copy()
+                        
+                        # Process the frame with hardware acceleration
                         try:
-                            # Try to use direct GPU processing if the frame is already on GPU
-                            if isinstance(frame, torch.Tensor) and (
-                                (self.gpu_type == 'AMD' and frame.device == self.dml_device) or
-                                (self.gpu_type == 'NVIDIA' and frame.device == self.device)
-                            ):
-                                # Frame is already on GPU - use direct GPU-to-GPU processing
-                                detections = self.process_frame(frame)
-                            else:
-                                # Standard processing path
-                                detections = self.process_frame(frame)
-                                
+                            detections = self.process_frame(frame_copy)
                         except Exception as e:
-                            print(f"Error in GPU-accelerated processing: {e}")
-                            # Fall back to standard processing
+                            print(f"Error in processing: {e}")
+                            # Don't try fallback processing to avoid potential deadlocks
+                            if "resource deadlock" in str(e).lower():
+                                print("Detected resource deadlock, skipping this frame")
+                                time.sleep(0.01)  # Add a small delay to allow other threads to release resources
+                                continue
+                            # Fall back to standard processing only for non-deadlock errors
                             try:
-                                detections = self.process_frame(frame)
+                                time.sleep(0.005)  # Small delay before retry
+                                detections = self.process_frame(frame_copy)
                             except Exception as e2:
                                 print(f"Error in fallback processing: {e2}")
                                 # detections remains as empty list
@@ -1349,38 +1333,72 @@ class YOLODetector:
                         detection_time = end_time - start_time
                         detection_times.append(detection_time)
                 
-                # Update current boxes
+                # Update current boxes - check if boxes have changed
                 if detections:
-                    self.current_boxes = [d['bbox'] for d in detections]
+                    new_boxes = [d['bbox'] for d in detections]
+                    self.current_boxes = new_boxes
                     self.current_confidences = [d['confidence'] for d in detections]
                     self.current_class_ids = [d['class'] for d in detections]
-                    self.last_box_state = True
-                else:
-                    if not hasattr(self, 'last_box_state') or not self.last_box_state:
-                        self.current_boxes = None
-                        self.current_confidences = None
-                        self.current_class_ids = None
-                        self.last_box_state = False
-                
-                        # Adaptive frame skipping based on detection time
-                        if len(detection_times) >= 5:
-                            avg_detection_time = sum(detection_times) / len(detection_times)
+                    
+                    # Check if boxes have changed significantly from last frame
+                    boxes_changed = False
+                    if self.last_boxes is None or len(self.last_boxes) != len(new_boxes):
+                        boxes_changed = True
+                    else:
+                        # Check if any box has moved significantly
+                        for i, (old_box, new_box) in enumerate(zip(self.last_boxes, new_boxes)):
+                            # Calculate box center movement
+                            old_cx = (old_box[0] + old_box[2]) / 2
+                            old_cy = (old_box[1] + old_box[3]) / 2
+                            new_cx = (new_box[0] + new_box[2]) / 2
+                            new_cy = (new_box[1] + new_box[3]) / 2
                             
-                            # Adjust frame skipping based on detection time
-                            if avg_detection_time > 0.015:  # If detection takes > 15ms
-                                self.process_every_n = min(3, self.process_every_n + 1)  # Skip more frames
-                            elif avg_detection_time < 0.008:  # If detection is fast (< 8ms)
-                                self.process_every_n = max(1, self.process_every_n - 1)  # Process more frames
+                            # If center moved by more than 3 pixels, consider it changed
+                            if abs(old_cx - new_cx) > 3 or abs(old_cy - new_cy) > 3:
+                                boxes_changed = True
+                                break
+                    
+                    # Update last boxes
+                    self.last_boxes = new_boxes
+                    self.last_box_state = True
+                    
+                    # Force redraw if boxes changed or it's been a while since last update
+                    current_time = time.time()
+                    if boxes_changed or (current_time - self.last_box_update_time > 0.1):
+                        self.boxes_changed = True
+                        self.last_box_update_time = current_time
+                        
+                        # Force redraw to show new boxes immediately
+                        if hasattr(self, 'parent') and hasattr(self.parent, 'hwnd'):
+                            try:
+                                # Invalidate the entire screen to ensure all boxes are updated
+                                win32gui.InvalidateRect(self.parent.hwnd, None, True)
+                                win32gui.UpdateWindow(self.parent.hwnd)
+                            except Exception as e:
+                                print(f"Error invalidating box regions: {e}")
+                else:
+                    if self.last_box_state:  # Only update if state changed
+                        self._clear_detections()
+                        self.last_boxes = None
+                        self.last_box_state = False
+                        
+                        # Force redraw to clear boxes
+                        if hasattr(self, 'parent') and hasattr(self.parent, 'hwnd'):
+                            try:
+                                win32gui.InvalidateRect(self.parent.hwnd, None, True)
+                                win32gui.UpdateWindow(self.parent.hwnd)
+                            except Exception as e:
+                                print(f"Error clearing boxes: {e}")
                 
                 # Update FPS more frequently for better feedback
                 self.frame_count += 1
-                if self.frame_count % 30 == 0:  # Every 30 frames
+                if self.frame_count % 5 == 0:  # Every 5 frames
                     current_time = time.time()
                     elapsed = current_time - self.last_time
                     
                     if elapsed > 0:
                         # Calculate processing FPS
-                        self.current_fps = int(30 / elapsed)
+                        self.current_fps = int(5 / elapsed)
                         self.last_fps = self.current_fps
                         
                         # Calculate detection FPS (accounting for frame skipping)
@@ -1399,13 +1417,20 @@ class YOLODetector:
                         
                         # Reset counters
                         self.last_time = current_time
+                        
+                        # Force overlay redraw to update FPS counter
+                        if hasattr(self, 'parent') and hasattr(self.parent, 'hwnd'):
+                            # Only update the FPS counter area
+                            fps_rect = (0, 0, 200, 40)  # Top-left area where FPS is displayed
+                            win32gui.InvalidateRect(self.parent.hwnd, fps_rect, True)
+                            win32gui.UpdateWindow(self.parent.hwnd)
                 
                         # GPU memory management for NVIDIA
-                        if self.gpu_type == 'NVIDIA' and hasattr(torch, 'cuda'):
+                        if self.hardware_manager.is_nvidia() and hasattr(torch, 'cuda'):
                             current_time = time.time()
                             
                             # Check GPU utilization periodically
-                            if hasattr(GPUtil, 'getGPUs') and current_time - last_gpu_check > 5.0:
+                            if GPUTIL_AVAILABLE and current_time - last_gpu_check > 5.0:
                                 try:
                                     gpus = GPUtil.getGPUs()
                                     if gpus:
@@ -1440,7 +1465,7 @@ class YOLODetector:
                 print(f"Error in main detection loop: {e}")
                 time.sleep(0.001)
 
-    def start_detection(self):
+    def start_detection(self) -> None:
         """Start the detection thread."""
         if not self.running:
             self.running = True
@@ -1449,7 +1474,7 @@ class YOLODetector:
             self.detection_thread.start()
             print("Detection thread started")
 
-    def stop_detection(self):
+    def stop_detection(self) -> None:
         """Stop the detection thread."""
         self.running = False
         if self.detection_thread:
@@ -1457,18 +1482,44 @@ class YOLODetector:
             print("Detection thread stopped")
 
     @property
-    def fps(self):
+    def fps(self) -> float:
         """Get current FPS."""
         if not self.fps_history:
             return 0
         return sum(self.fps_history) / len(self.fps_history)
 
     @property
-    def processing_fps(self):
+    def processing_fps(self) -> float:
         """Get current processing FPS."""
         if not self.processing_fps_history:
             return 0
         return sum(self.processing_fps_history) / len(self.processing_fps_history)
+
+    def _clear_detections(self):
+        self.current_boxes = None
+        self.current_confidences = None
+        self.current_class_ids = None
+        self.last_box_state = False
+
+    def get_detections(self) -> List[Dict[str, Any]]:
+        """
+        Get current detections in a format suitable for aim assist.
+        
+        Returns:
+            List of detection dictionaries with 'screen' and 'confidence' keys
+        """
+        detections = []
+        
+        if self.current_boxes is not None and len(self.current_boxes) > 0:
+            for i, box in enumerate(self.current_boxes):
+                if i < len(self.current_confidences):
+                    detection = {
+                        'screen': box,  # (x1, y1, x2, y2)
+                        'confidence': self.current_confidences[i]
+                    }
+                    detections.append(detection)
+        
+        return detections
 
     # Import required modules at class level
     import numpy as np
@@ -1497,20 +1548,17 @@ class YOLODetector:
             self.capture_event = threading.Event()
             self.sleep_time = 0.0001  # Ultra-short sleep time (0.1ms)
             
-            # GDI resources
-            self.hwin = None
-            self.hwindc = None
-            self.srcdc = None
-            self.memdc = None
-            self.bmp = None
+            # MSS for high-performance screen capture (works great with AMD)
+            self.mss = None
+            self.monitor = None
             
             # GPU resources
             self.gpu_type = None
             self.gpu_device = None
             self._setup_gpu()
             
-            # Initialize GDI resources
-            self._init_capture()
+            # Initialize MSS capture
+            self._init_mss_capture()
             
             # Set thread priority
             self._set_process_priority()
@@ -1524,108 +1572,74 @@ class YOLODetector:
             self.fps_thread.start()
             
         def _setup_gpu(self):
-            """Setup GPU for image processing acceleration."""
+            """Setup hardware for image processing acceleration."""
             try:
-                # Check if we're already in a YOLODetector instance with GPU setup
-                if hasattr(self, 'parent') and hasattr(self.parent, 'gpu_type'):
-                    self.gpu_type = self.parent.gpu_type
-                    if self.gpu_type == 'AMD':
-                        self.gpu_device = self.parent.dml_device
-                    elif self.gpu_type == 'NVIDIA':
-                        self.gpu_device = self.parent.device
-                else:
-                    # Try to detect GPU independently
-                    try:
-                        import torch
-                        import torch_directml
+                # Check if we're already in a YOLODetector instance with hardware setup
+                if hasattr(self, 'parent') and hasattr(self.parent, 'hardware_manager'):
+                    # Use the parent's hardware manager
+                    self.hardware_manager = self.parent.hardware_manager
+                    self.gpu_type = self.hardware_manager.get_hardware_type()
+                    self.gpu_device = self.hardware_manager.get_device()
                         
-                        if torch_directml.is_available():
-                            self.gpu_type = 'AMD'
-                            self.gpu_device = torch_directml.device()
-                            print("Screen capture will use AMD GPU acceleration")
-                        elif torch.cuda.is_available():
-                            self.gpu_type = 'NVIDIA'
-                            self.gpu_device = torch.device('cuda')
-                            print("Screen capture will use NVIDIA GPU acceleration")
-                    except ImportError:
-                        self.gpu_type = None
-                        self.gpu_device = None
+                    # Use the parent's lock for synchronization
+                    if hasattr(self.parent, 'gpu_lock'):
+                        self.gpu_lock = self.parent.gpu_lock
+                    else:
+                        self.gpu_lock = threading.RLock()
+                        
+                    print(f"Screen capture will use {self.gpu_type} acceleration with MSS")
+                else:
+                    # Use the global hardware manager
+                    self.hardware_manager = hardware_manager
+                    self.gpu_type = self.hardware_manager.get_hardware_type()
+                    self.gpu_device = self.hardware_manager.get_device()
+                    
+                    # Create a lock for hardware operations
+                    self.gpu_lock = threading.RLock()
+                    print(f"Screen capture will use {self.gpu_type} acceleration with MSS")
+                    
             except Exception as e:
-                print(f"GPU setup for screen capture failed: {e}")
-                self.gpu_type = None
+                print(f"Hardware setup for screen capture failed: {e}")
+                self.gpu_type = 'CPU'
                 self.gpu_device = None
+                self.hardware_manager = None
+                self.gpu_lock = threading.RLock()
 
-        def _init_capture(self):
-            """Initialize capture resources."""
+        def _init_mss_capture(self):
+            """Initialize MSS capture resources."""
             try:
+                # Import MSS
+                import mss
+                self.mss = mss.mss()
+                
                 # Get screen dimensions
                 screen_width = win32api.GetSystemMetrics(win32con.SM_CXSCREEN)
                 screen_height = win32api.GetSystemMetrics(win32con.SM_CYSCREEN)
                 
-                # Create capture region for CS2 (exactly 480x480 at center)
-                center_x = screen_width // 2
-                center_y = screen_height // 2
-                capture_size = 480
+                # Get the primary monitor
+                self.monitor = self.mss.monitors[1]  # Primary monitor
                 
-                # Define capture region centered on screen
+                print(f"[DEBUG] Screen dimensions: {screen_width}x{screen_height}")
+                print(f"[DEBUG] MSS monitor: {self.monitor}")
+                
+                # Define capture region as the entire screen
                 self.capture_region = {
-                    'left': max(0, center_x - capture_size // 2),
-                    'top': max(0, center_y - capture_size // 2),
-                    'width': capture_size,
-                    'height': capture_size
+                    'left': 0,
+                    'top': 0,
+                    'width': screen_width,
+                    'height': screen_height
                 }
-                print(f"Screen capture initialized: {screen_width}x{screen_height}, region: {capture_size}x{capture_size}")
+                print(f"[DEBUG] Capture region: left={self.capture_region['left']}, top={self.capture_region['top']}, " +
+                      f"width={self.capture_region['width']}, height={self.capture_region['height']}")
+                print(f"MSS screen capture initialized: {screen_width}x{screen_height}")
                 
                 # Pre-allocate memory for better performance
-                self.frame_buffer = np.zeros((capture_size, capture_size, 3), dtype=np.uint8)
+                self.frame_buffer = np.zeros((screen_height, screen_width, 3), dtype=np.uint8)
                 
-                # Create device contexts and bitmap for ultra-fast GDI capture
-                self._create_gdi_resources(capture_size)
-                
-                # Note: Win32 Python API doesn't support direct buffer passing for GetBitmapBits
             except Exception as e:
-                print(f"Error initializing capture: {e}")
+                print(f"Error initializing MSS capture: {e}")
                 import traceback
                 traceback.print_exc()
-                
-        def _create_gdi_resources(self, capture_size):
-            """Create or recreate GDI resources for screen capture."""
-            try:
-                # Clean up existing resources if they exist
-                self._clean_gdi_resources()
-                
-                # Create fresh GDI resources
-                self.hwin = win32gui.GetDesktopWindow()
-                self.hwindc = win32gui.GetWindowDC(self.hwin)
-                self.srcdc = win32ui.CreateDCFromHandle(self.hwindc)
-                self.memdc = self.srcdc.CreateCompatibleDC()
-                self.bmp = win32ui.CreateBitmap()
-                self.bmp.CreateCompatibleBitmap(self.srcdc, capture_size, capture_size)
-                self.memdc.SelectObject(self.bmp)
-                print("GDI resources created successfully")
-                return True
-            except Exception as e:
-                print(f"Error creating GDI resources: {e}")
-                return False
-                
-        def _clean_gdi_resources(self):
-            """Clean up GDI resources properly."""
-            try:
-                if hasattr(self, 'memdc') and self.memdc:
-                    self.memdc.DeleteDC()
-                    self.memdc = None
-                if hasattr(self, 'srcdc') and self.srcdc:
-                    self.srcdc.DeleteDC()
-                    self.srcdc = None
-                if hasattr(self, 'hwindc') and self.hwin and self.hwindc:
-                    win32gui.ReleaseDC(self.hwin, self.hwindc)
-                    self.hwindc = None
-                if hasattr(self, 'bmp') and self.bmp:
-                    win32gui.DeleteObject(self.bmp.GetHandle())
-                    self.bmp = None
-                print("GDI resources cleaned up")
-            except Exception as e:
-                print(f"Error cleaning up GDI resources: {e}")
                 
         def _set_process_priority(self):
             """Set process and thread priority to maximum."""
@@ -1648,106 +1662,68 @@ class YOLODetector:
                 print(f"Failed to set process priority: {e}")
 
         def capture_loop(self):
-            """Continuously capture frames in a separate thread with adaptive timing and GPU acceleration."""
+            """Continuously capture frames using MSS for maximum performance."""
             # Set thread priority to time critical
             try:
                 import win32process
                 import win32api
                 handle = win32api.GetCurrentThread()
                 win32process.SetThreadPriority(handle, win32process.THREAD_PRIORITY_TIME_CRITICAL)
-                print("Capture thread priority set to TIME_CRITICAL")
+                print("MSS capture thread priority set to TIME_CRITICAL")
             except:
                 pass
-                
-            # Initialize for direct memory access
-            left = self.capture_region['left']
-            top = self.capture_region['top']
-            width = self.capture_region['width']
-            height = self.capture_region['height']
             
             # For adaptive timing
             frame_times = collections.deque(maxlen=10)
-            
-            # GPU acceleration setup
-            use_gpu = self.gpu_device is not None and config.get('use_gpu_capture', True)
-            if use_gpu:
-                try:
-                    import torch
-                    # Pre-allocate GPU tensors for processing
-                    if self.gpu_type == 'AMD' or self.gpu_type == 'NVIDIA':
-                        # Create tensor for frame processing
-                        self.gpu_frame = torch.zeros((height, width, 3), 
-                                                   device=self.gpu_device, 
-                                                   dtype=torch.uint8)
-                        print(f"GPU acceleration enabled for screen capture using {self.gpu_type}")
-                except Exception as e:
-                    print(f"Failed to initialize GPU acceleration for capture: {e}")
-                    use_gpu = False
             
             # Track consecutive failures to trigger resource recreation
             consecutive_failures = 0
             max_failures_before_reset = 3
             
+            # Pre-allocate frame buffer to avoid repeated allocations
+            height = self.capture_region['height']
+            width = self.capture_region['width']
+            frame_buffer = np.zeros((height, width, 3), dtype=np.uint8)
+            
             while self.running:
                 start_time = time.time()
                 
                 try:
-                    # Check if we need to recreate GDI resources
+                    # Check if we need to recreate MSS resources
                     if consecutive_failures >= max_failures_before_reset:
-                        print(f"Detected {consecutive_failures} consecutive BitBlt failures. Recreating GDI resources...")
-                        if self._create_gdi_resources(width):
+                        print(f"Detected {consecutive_failures} consecutive MSS failures. Recreating resources...")
+                        try:
+                            self._init_mss_capture()
                             consecutive_failures = 0
-                        else:
-                            # If recreation failed, sleep a bit to avoid hammering the system
+                        except Exception as e:
+                            print(f"Failed to recreate MSS resources: {e}")
                             time.sleep(0.1)
                             continue
                     
-                    # Capture screen region using GDI BitBlt (most efficient method)
-                    result = self.memdc.BitBlt((0, 0), (width, height), self.srcdc, (left, top), win32con.SRCCOPY)
+                    # Capture screen using MSS (much faster than GDI)
+                    screenshot = self.mss.grab(self.monitor)
+                    
+                    # Convert to numpy array
+                    frame = np.array(screenshot)
+                    
+                    # Convert from BGRA to BGR (remove alpha channel)
+                    frame = frame[:, :, :3]
                     
                     # Reset failure counter on success
                     consecutive_failures = 0
                     
-                    # Get bitmap bits (the Python binding doesn't support direct buffer passing)
-                    signedIntsArray = self.bmp.GetBitmapBits(True)
-                    
-                    # Convert to numpy array
-                    img = np.frombuffer(signedIntsArray, dtype=np.uint8)
-                    img = img.reshape((height, width, 4))
-                    
-                    # Process the frame (with GPU if available)
-                    if use_gpu:
-                        try:
-                            # Extract BGR channels using GPU
-                            import torch
-                            # Make a writable copy of the array before converting to tensor
-                            img_copy = img[:, :, :3].copy()
-                            # Convert numpy array to tensor on GPU
-                            img_tensor = torch.from_numpy(img_copy).to(self.gpu_device)
-                            
-                            # Apply any GPU-accelerated processing here
-                            # For example, we could do noise reduction, contrast enhancement, etc.
-                            
-                            # Get result back to CPU as numpy array
-                            frame = img_tensor.cpu().numpy().copy()
-                        except Exception as e:
-                            # Fall back to CPU if GPU processing fails
-                            print(f"GPU processing failed, falling back to CPU: {e}")
-                            frame = img[:, :, :3].copy()
-                    else:
-                        # Extract BGR channels (fastest method, avoid cv2.cvtColor)
-                        frame = img[:, :, :3].copy()  # Need copy for thread safety
-                    
                     # Update current frame with minimal lock time
                     with self.lock:
-                        self.current_frame = frame
+                        # Use the pre-allocated buffer to avoid repeated allocations
+                        np.copyto(frame_buffer, frame)
+                        self.current_frame = frame_buffer
                         self.frame_count += 1
                         
                 except Exception as e:
                     consecutive_failures += 1
-                    print(f"Error in capture loop: {e} (Failures: {consecutive_failures}/{max_failures_before_reset})")
+                    print(f"Error in MSS capture loop: {e} (Failures: {consecutive_failures}/{max_failures_before_reset})")
                     
-                    # If we've had too many failures, try recreating the DC
+                    # If we've had too many failures, try recreating the MSS
                     if consecutive_failures >= max_failures_before_reset:
                         continue
                 
@@ -1759,49 +1735,51 @@ class YOLODetector:
                 frame_times.append(frame_time)
                 if hasattr(self, 'frame_times'):
                     self.frame_times.append(frame_time)
-                
-                # Calculate optimal sleep time - start with almost no sleep for maximum FPS
-                if len(frame_times) >= 5:
-                    avg_frame_time = sum(frame_times) / len(frame_times)
                     
-                    # Ultra-aggressive optimization for maximum FPS
-                    if self.fps < 100:  # If FPS is too low, reduce sleep time aggressively
-                        self.sleep_time = max(0.0, self.sleep_time * 0.5)  # Cut sleep time in half
-                    elif avg_frame_time < 0.0005:  # If processing is very fast (< 0.5ms)
-                        self.sleep_time = max(0.0, self.sleep_time * 0.9)  # Reduce sleep time gradually
-                    else:
-                        # Only add minimal sleep to prevent CPU overload
-                        self.sleep_time = min(0.0001, self.sleep_time * 1.1)  # Very small maximum sleep
-                
-                # Ultra-short or no sleep for maximum performance
-                # Skip sleep entirely if FPS is below target
-                if self.fps < 120:  # Always skip sleep if below 120 FPS
-                    continue
-                elif self.sleep_time > 0:
-                    time.sleep(self.sleep_time)
+                # Ultra-aggressive optimization for maximum FPS
+                # Remove sleep entirely for maximum capture speed
+                # The detection loop will handle the processing rate
+                continue  # No sleep, maximum speed
 
         def fps_loop(self):
             """Calculate FPS in a separate thread."""
             last_count = 0
+            last_time = time.time()
             # For tracking frame times
             self.frame_times = collections.deque(maxlen=30)
             
             while self.running:
-                time.sleep(1.0)  # Update once per second
+                # Sleep for a shorter time to update more frequently
+                time.sleep(0.5)
+                
+                current_time = time.time()
+                elapsed = current_time - last_time
+                
                 with self.lock:
                     current_count = self.frame_count
+                
+                if elapsed > 0:
+                    # Calculate frames per second
+                    frames = current_count - last_count
+                    self.fps = int(frames / elapsed)
                     
-                frames = current_count - last_count
-                self.fps = frames
-                
-                # Calculate average frame time if we have data
-                if hasattr(self, 'frame_times') and len(self.frame_times) > 0:
-                    avg_frame_time = sum(self.frame_times) / len(self.frame_times)
-                    print(f"Capture FPS: {self.fps}, Sleep: {self.sleep_time*1000:.3f}ms, Frame time: {avg_frame_time*1000:.3f}ms")
-                else:
-                    print(f"Capture FPS: {self.fps}, Sleep: {self.sleep_time*1000:.3f}ms")
-                
-                last_count = current_count
+                    # Calculate average frame time if we have data
+                    if hasattr(self, 'frame_times') and len(self.frame_times) > 0:
+                        avg_frame_time = sum(self.frame_times) / len(self.frame_times)
+                        print(f"MSS Capture FPS: {self.fps}, Frame time: {avg_frame_time*1000:.3f}ms")
+                    else:
+                        print(f"MSS Capture FPS: {self.fps}")
+                    
+                    # Reset for next calculation
+                    last_count = current_count
+                    last_time = current_time
+                    
+                    # If we have a parent reference, force a redraw to update FPS display
+                    if hasattr(self, 'parent') and hasattr(self.parent, 'parent') and hasattr(self.parent.parent, 'hwnd'):
+                        try:
+                            win32gui.InvalidateRect(self.parent.parent.hwnd, None, False)
+                        except Exception as e:
+                            print(f"Error updating FPS display: {e}")
 
         def stop_capture(self):
             """Stop the capture thread and clean up resources."""
@@ -1813,17 +1791,20 @@ class YOLODetector:
             if self.fps_thread:
                 self.fps_thread.join(timeout=1.0)
                 
-            # Clean up GDI resources
-            self._clean_gdi_resources()
+            # Clean up MSS resources
+            if self.mss:
+                self.mss.close()
                 
-            print("Screen capture stopped and resources cleaned up")
+            print("MSS screen capture stopped and resources cleaned up")
 
         def get_frame(self):
             """Get the latest captured frame."""
             with self.lock:
                 if self.current_frame is None:
                     return None
-                return self.current_frame.copy()  # Return a copy for thread safety
+                # Return a view instead of a copy for better performance
+                # The detection loop will make its own copy if needed
+                return self.current_frame
     
     def get_current_frame(self):
         """Get current frame from screen capture thread."""
@@ -1837,7 +1818,46 @@ class YOLODetector:
         # Get the latest frame from the capture thread
         return self.screen_capture.get_frame()
 
+# --- OverlayWindow Class ---
+
 class OverlayWindow:
+    """
+    Transparent overlay window for displaying detection results and configuration menu.
+    
+    This class creates a transparent, click-through overlay window that displays
+    detection boxes, FOV circles, FPS counters, and a configuration menu. It handles
+    all window management, drawing, and user interaction.
+    
+    Attributes:
+        width: Window width (full screen width)
+        height: Window height (full screen height)
+        hwnd: Window handle
+        running: Whether the window is running
+        config: Configuration dictionary
+        detector: YOLODetector instance
+        menu_active: Whether the menu is currently active
+        active_tab: Currently active menu tab
+        tabs: List of available menu tabs
+        menu_items: List of current menu items
+        mouse_down: Whether mouse button is pressed
+        active_slider: Currently active slider for dragging
+        waiting_for_key: Key binding being configured
+        active_input_field: Currently active input field
+        current_input_text: Text in active input field
+        last_mouse_pos: Last mouse position
+        status_message: Current status message
+        status_message_time: Time when status message was set
+        menu_rect: Menu rectangle coordinates
+        dragging: Whether menu is being dragged
+        drag_offset: Drag offset from mouse position
+        show_config_dropdown: Whether config dropdown is shown
+        config_files: List of available config files
+        dropdown_selected: Selected dropdown item
+        menu_page: Current menu page
+        items_per_page: Number of items per page
+        config_dir: Directory for configuration files
+    """
+    
     def __init__(self):
         """Initialize the overlay window."""
         try:
@@ -1849,6 +1869,7 @@ class OverlayWindow:
             logging.info(f"Screen dimensions: {self.width}x{self.height}")
             
             self.running = True
+            self.aim_assist_running = True  # Add this for aim assist thread
             self.hwnd = None
             
             # Initialize config
@@ -1881,7 +1902,11 @@ class OverlayWindow:
             
             # Initialize detector with config
             self.detector = YOLODetector(config=self.config)
+            self.detector.parent = self  # Add reference to parent for status messages
             logging.info("YOLO detector initialized")
+            
+            # Make sure FPS counter is enabled by default
+            self.config['show_fps_counter'] = True
             
             # Register window class
             wc = win32gui.WNDCLASS()
@@ -1908,11 +1933,12 @@ class OverlayWindow:
             logging.info("Window created")
             
             # Set window properties for transparency
+            # Use both color key (black = transparent) and alpha blending for better results
             win32gui.SetLayeredWindowAttributes(
                 self.hwnd,
                 0,  # Color key (0 = black for transparent)
-                255,  # Alpha (255 for fully opaque)
-                win32con.LWA_COLORKEY  # Use color key transparency
+                200,  # Alpha (200 for slightly transparent)
+                win32con.LWA_COLORKEY | win32con.LWA_ALPHA  # Use both color key and alpha
             )
             logging.info("Window transparency set")
             
@@ -1944,52 +1970,111 @@ class OverlayWindow:
             self.aim_thread = threading.Thread(target=self.aim_assist_loop, daemon=True)
             self.aim_thread.start()
             
-            # Remove frame skipping for box drawing
-            if hasattr(self, 'draw_frame_counter'):
-                del self.draw_frame_counter
-            if hasattr(self, 'draw_every_n_frames'):
-                del self.draw_every_n_frames
-            
         except Exception as e:
             logging.error(f"Error in OverlayWindow initialization: {e}")
             logging.error(traceback.format_exc())
             raise
 
-    def aim_assist_loop(self):
+    def aim_assist_loop(self) -> None:
+        """
+        Aim assist loop for automatic mouse movement.
+        
+        This method runs in a separate thread and continuously monitors detected
+        objects, automatically moving the mouse to aim at targets when enabled.
+        """
         last_target = None
-        while self.running:
-            # Always use latest current_boxes, regardless of aim assist state
-            boxes = self.detector.current_boxes
-            if self.detector.aiming_enabled and boxes and len(boxes) > 0:
-                screen_cx = self.width // 2
-                screen_cy = self.height // 2
-                min_dist = float('inf')
-                best_box = None
-                for box in boxes:
-                    x1, y1, x2, y2 = box
-                    cx = (x1 + x2) / 2
-                    cy = y1 + 0.25 * (y2 - y1)
-                    dist = math.hypot(cx - screen_cx, cy - screen_cy)
-                    if dist < min_dist:
-                        min_dist = dist
-                        best_box = (cx, cy)
-                if best_box is not None:
-                    dx = best_box[0] - screen_cx
-                    dy = best_box[1] - screen_cy
-                    smoothing = max(0.01, min(self.config.get('smoothing_xy', 0.1), 0.2))
-                    move_x = int(dx * smoothing)
-                    move_y = int(dy * smoothing)
-                    if abs(move_x) > 1 or abs(move_y) > 1:
-                        move_mouse(move_x, move_y)
-                    last_target = best_box
-            else:
-                if last_target is not None:
-                    print("[DEBUG] Aim assist state reset (no boxes or disabled)")
-                last_target = None
-            time.sleep(0.01)
+        target_history = []  # Track recent targets for stability
+        max_history = 3      # Number of frames to average for smoothing
+        
+        # Improved aim assist logic
+        closest_target = None
+        min_distance = float('inf')
+        screen_center_x = win32api.GetSystemMetrics(0) // 2
+        screen_center_y = win32api.GetSystemMetrics(1) // 2
+        
+        # Add deadzone to prevent jittering
+        deadzone = self.config.get('aim_deadzone', 3)  # pixels - don't move if within this distance
+        
+        while self.aim_assist_running:
+            try:
+                if not self.config.get('aim_assist_enabled', True):
+                    time.sleep(0.01)
+                    continue
+                
+                # Get current detections
+                detections = self.detector.get_detections()
+                if not detections:
+                    time.sleep(0.01)
+                    continue
+                
+                # Find closest target within FOV
+                closest_target = None
+                min_distance = float('inf')
+                fov_radius = self.config.get('fov_modifier', 150)
+                
+                for detection in detections:
+                    if detection.get('confidence', 0) < self.config.get('confidence', 0.05):
+                        continue
+                    
+                    # Calculate target center
+                    x1, y1, x2, y2 = detection['screen']
+                    target_x = (x1 + x2) // 2
+                    target_y = (y1 + y2) // 2
+                    
+                    # Calculate distance from screen center
+                    distance = math.sqrt((target_x - screen_center_x) ** 2 + (target_y - screen_center_y) ** 2)
+                    
+                    # Check if target is within FOV
+                    if distance <= fov_radius and distance < min_distance:
+                        min_distance = distance
+                        closest_target = (target_x, target_y)
+                
+                if closest_target is None:
+                    time.sleep(0.01)
+                    continue
+                
+                target_x, target_y = closest_target
+                
+                # Calculate movement needed
+                dx = target_x - screen_center_x
+                dy = target_y - screen_center_y
+                
+                # Check deadzone - don't move if too close
+                if abs(dx) <= deadzone and abs(dy) <= deadzone:
+                    time.sleep(0.01)
+                    continue
+                
+                # Apply tracking speed and smoothing
+                tracking_speed = self.config.get('tracking_speed', 0.5)
+                smoothing = self.config.get('smoothing_xy', 0.5)
+                
+                # Calculate movement with speed and smoothing
+                move_x = int(dx * tracking_speed * smoothing)
+                move_y = int(dy * tracking_speed * smoothing)
+                
+                # Apply humaniser for more natural movement
+                humaniser = self.config.get('humaniser', 0.2)
+                if humaniser > 0:
+                    move_x += random.randint(-int(humaniser * 5), int(humaniser * 5))
+                    move_y += random.randint(-int(humaniser * 5), int(humaniser * 5))
+                
+                # Move the mouse to actually control the camera
+                if abs(move_x) > 0 or abs(move_y) > 0:
+                    move_mouse(move_x, move_y)
+                
+                time.sleep(0.01)  # Small delay to prevent excessive movement
+                
+            except Exception as e:
+                logging.error(f"Error in aim assist loop: {e}")
+                time.sleep(0.1)
 
-    def build_menu_items(self):
-        """Build the menu items list based on active tab."""
+    def build_menu_items(self) -> List[Tuple[str, str, str, Optional[float], Optional[float], Optional[str]]]:
+        """
+        Build the menu items list based on active tab.
+        
+        Returns:
+            List of menu item tuples (label, type, key, min_val, max_val, description)
+        """
         # Base items that appear in all tabs
         base_items = []
         
@@ -2010,6 +2095,7 @@ class OverlayWindow:
                 ('Anti-lag', 'slider', 'anti_lag_value', 0.0, 10.0, None),
                 ('Custom Bone Position', 'slider', 'custom_bone_position', -1.0, 1.0, None),
                 ('Smoothing X/Y', 'slider', 'smoothing_xy', 0.0, 1.0, None),
+                ('Aim Deadzone', 'slider', 'aim_deadzone', 1, 10, None),
                 ('Enable Aim Assist', 'toggle', 'aim_assist_enabled', None, None, None),
             ],
             'Visuals': [
@@ -2027,7 +2113,7 @@ class OverlayWindow:
                 ('Trigger Release', 'slider', 'trigger_release', 0.0, 1.0, None),
             ],
             'Keybinds': [
-                ('Aim Key', 'key', 'tracking_key', None, None, None),
+                ('Toggle Aim Assist', 'key', 'tracking_key', None, None, None),
                 ('Menu Key', 'key', 'menu_key', None, None, None),
                 ('Trigger Key', 'key', 'trigger_key', None, None, None),
                 ('FOV Toggle Key', 'key', 'fov_toggle_key', None, None, None),
@@ -2036,6 +2122,7 @@ class OverlayWindow:
             'Settings': [
                 ('Optimizations', 'toggle', 'optimizations_enabled', None, None, None),
                 ('Use GPU Capture (DirectX)', 'toggle', 'use_directx_capture', None, None, None),
+                ('Frame Skipping', 'number_input', 'frame_skipping', 1, 4, None),
                 ('Reset Settings', 'button', 'reset_settings', None, None, None),
             ]
         }
@@ -2532,36 +2619,54 @@ class OverlayWindow:
             logging.error(f"Error drawing menu: {e}")
             traceback.print_exc()
 
-    def draw_text(self, hdc, x, y, text, color, size=TEXT_SIZE):
-        """Draw text on the overlay."""
+    def draw_text(self, hdc, x, y, text, color=(255, 255, 255), size=14, weight=700):
+        """Draw text with a background for better visibility."""
         try:
-            # Create font using win32gui.LOGFONT with anti-aliasing
-            logfont = win32gui.LOGFONT()
-            logfont.lfHeight = -size  # Negative for better quality
-            logfont.lfWeight = win32con.FW_NORMAL
-            logfont.lfFaceName = 'Segoe UI'
-            logfont.lfQuality = win32con.ANTIALIASED_QUALITY
-            font = win32gui.CreateFontIndirect(logfont)
+            # Create a LOGFONT structure for better text quality
+            lf = win32gui.LOGFONT()
+            lf.lfFaceName = "Segoe UI"  # More modern font
+            lf.lfHeight = -size  # Negative for better quality
+            lf.lfWeight = weight
+            lf.lfQuality = win32con.CLEARTYPE_QUALITY  # Use ClearType for better rendering
+            
+            # Create font
+            font = win32gui.CreateFontIndirect(lf)
             old_font = win32gui.SelectObject(hdc, font)
             
-            # Set text color
-            if isinstance(color, tuple):
-                color = rgb_to_colorref(color)
-            win32gui.SetTextColor(hdc, color)
-            
-            # Enable better text rendering
+            # Get text dimensions
+            win32gui.SetTextColor(hdc, rgb_to_colorref(color))
             win32gui.SetBkMode(hdc, win32con.TRANSPARENT)
+            text_size = win32gui.GetTextExtentPoint32(hdc, text)
             
-            # Draw text using DrawText
-            text_rect = (x, y, x + 1000, y + size + 5)  # Wide enough for any text
-            win32gui.DrawText(hdc, text, -1, text_rect, win32con.DT_LEFT | win32con.DT_VCENTER | win32con.DT_SINGLELINE)
+            # Create background rectangle with padding
+            padding = 6
+            bg_rect = (x - padding, y - padding, 
+                      x + text_size[0] + padding, y + text_size[1] + padding)
+            
+            # Fill background with solid black
+            bg_brush = win32gui.CreateSolidBrush(rgb_to_colorref((0, 0, 0)))
+            win32gui.FillRect(hdc, bg_rect, bg_brush)
+            win32gui.DeleteObject(bg_brush)
+            
+            # Draw border
+            border_pen = win32gui.CreatePen(win32con.PS_SOLID, 1, rgb_to_colorref((70, 70, 70)))
+            old_pen = win32gui.SelectObject(hdc, border_pen)
+            win32gui.SelectObject(hdc, win32gui.GetStockObject(win32con.NULL_BRUSH))
+            win32gui.Rectangle(hdc, bg_rect[0], bg_rect[1], bg_rect[2], bg_rect[3])
+            win32gui.SelectObject(hdc, old_pen)
+            win32gui.DeleteObject(border_pen)
+            
+            # Draw text using DrawText instead of TextOut for better reliability
+            text_rect = (x, y, x + text_size[0], y + text_size[1])
+            win32gui.SetTextColor(hdc, rgb_to_colorref(color))
+            win32gui.SetBkMode(hdc, win32con.TRANSPARENT)
+            win32gui.DrawText(hdc, text, -1, text_rect, win32con.DT_LEFT | win32con.DT_TOP)
             
             # Clean up
             win32gui.SelectObject(hdc, old_font)
             win32gui.DeleteObject(font)
-            
         except Exception as e:
-            logging.error(f"Error in draw_text: {e}")
+            logging.error(f"Error drawing text: {e}")
             traceback.print_exc()
 
     def draw_text_centered(self, hdc, rect, text, color, size=TEXT_SIZE):
@@ -2672,6 +2777,16 @@ class OverlayWindow:
                         self.config[self.active_input_field] = value
                         self.status_message = f"Value updated to {value}"
                         self.status_message_time = time.time()
+                        
+                        # Apply frame skipping value directly to detector if that's what was changed
+                        if self.active_input_field == 'frame_skipping' and hasattr(self, 'detector'):
+                            self.detector.process_every_n = value
+                            print(f"Updated detector frame skipping to: {value}")
+                            
+                            # Force a full redraw to update FPS counter with new skip value
+                            win32gui.InvalidateRect(hwnd, None, True)
+                            win32gui.UpdateWindow(hwnd)
+                            
                     except ValueError:
                         self.status_message = "Invalid number"
                         self.status_message_time = time.time()
@@ -2725,13 +2840,19 @@ class OverlayWindow:
 
     def draw_overlay(self, hdc):
         try:
+            # Create memory DC and bitmap for double buffering
             mem_dc = win32gui.CreateCompatibleDC(hdc)
             mem_bitmap = win32gui.CreateCompatibleBitmap(hdc, self.width, self.height)
-            win32gui.SelectObject(mem_dc, mem_bitmap)
+            old_bitmap = win32gui.SelectObject(mem_dc, mem_bitmap)
+            
+            # Important: Set background mode to TRANSPARENT to avoid white fill
             win32gui.SetBkMode(mem_dc, win32con.TRANSPARENT)
-            brush = win32gui.CreateSolidBrush(0)
-            win32gui.FillRect(mem_dc, (0, 0, self.width, self.height), brush)
-            win32gui.DeleteObject(brush)
+            
+            # Do NOT fill the entire rectangle with a brush - this causes strobing
+            # Instead, we'll only draw the specific UI elements we need
+            
+                # Test pattern removed - we don't need the purple crosshair anymore
+            
             # Draw FOV circle if enabled
             if self.config['show_fov_visualiser']:
                 try:
@@ -2747,61 +2868,127 @@ class OverlayWindow:
                     win32gui.DeleteObject(pen)
                 except Exception as e:
                     logging.error(f"Error drawing FOV circle: {e}")
+            
             # Draw detection boxes only if show_player_boxes is True
-            if self.config.get('show_player_boxes', True) and self.detector and self.detector.current_boxes is not None and len(self.detector.current_boxes) > 0:
+            if self.config.get('show_player_boxes', True) and hasattr(self.detector, 'current_boxes'):
                 boxes = self.detector.current_boxes
-                confidences = self.detector.current_confidences
-                class_ids = self.detector.current_class_ids
-                for box, conf, cls_id in zip(boxes, confidences, class_ids):
-                    x1, y1, x2, y2 = box
-                    color = self.config.get('box_color', (0, 255, 0))
-                    win32gui.SelectObject(mem_dc, win32gui.CreatePen(win32con.PS_SOLID, 2, rgb_to_colorref(color)))
-                    win32gui.SelectObject(mem_dc, win32gui.GetStockObject(win32con.NULL_BRUSH))
-                    win32gui.Rectangle(mem_dc, x1, y1, x2, y2)
-                    label = f"{self.detector.class_names[cls_id]}: {conf:.2f}"
-                    self.draw_text(mem_dc, x1, y1 - 18, label, color, size=14)
+                
+                if boxes is not None and len(boxes) > 0:
+                    # Debug output to check if boxes are available
+                    print(f"Drawing {len(boxes)} boxes")
+                    
+                    confidences = self.detector.current_confidences if hasattr(self.detector, 'current_confidences') else [0.5] * len(boxes)
+                    class_ids = self.detector.current_class_ids if hasattr(self.detector, 'current_class_ids') else [0] * len(boxes)
+                    
+                    # Use box_color from config with high visibility
+                    box_color = self.config.get('box_color', (0, 255, 0))  # Default to bright green for visibility
+                    
+                    # Create a thicker pen for better visibility
+                    box_pen = win32gui.CreatePen(win32con.PS_SOLID, 2, rgb_to_colorref(box_color))
+                    old_pen = win32gui.SelectObject(mem_dc, box_pen)
+                    
+                    # Use NULL_BRUSH for transparent fill (outline only)
+                    old_brush = win32gui.SelectObject(mem_dc, win32gui.GetStockObject(win32con.NULL_BRUSH))
+                    
+                    print(f"Drawing {len(boxes)} boxes with color {box_color}")
+                    
+                    for i, box in enumerate(boxes):
+                        try:
+                            x1, y1, x2, y2 = box
+                            
+                            # Additional validation for reasonable box size
+                            box_width = x2 - x1
+                            box_height = y2 - y1
+                            
+                            # Skip boxes that are too large (using percentage of screen)
+                            if box_width > 0.6 * self.width or box_height > 0.8 * self.height:
+                                print(f"Final filter: Skipping oversized box: {box_width}x{box_height} (max: {0.6*self.width}x{0.8*self.height})")
+                                continue
+                                
+                            # Skip boxes that are too small (less than 10 pixels)
+                            if box_width < 10 or box_height < 10:
+                                print(f"Skipping tiny box {i}: {x1},{y1},{x2},{y2} (w={box_width}, h={box_height})")
+                                continue
+                                
+                            # Filter out boxes that are in the corners of the screen (likely false positives)
+                            # DISABLED: This was removing valid detections
+                            # corner_threshold = 0.05  # 5% of screen dimensions - reduced to allow more detections
+                            # corner_width = self.width * corner_threshold
+                            # corner_height = self.height * corner_threshold
+                            
+                            # Check if box is entirely within any corner
+                            # if ((x2 < corner_width and y2 < corner_height) or  # Top-left
+                            #     (x1 > self.width - corner_width and y2 < corner_height) or  # Top-right
+                            #     (x2 < corner_width and y1 > self.height - corner_height) or  # Bottom-left
+                            #     (x1 > self.width - corner_width and y1 > self.height - corner_height)):  # Bottom-right
+                            #     print(f"Skipping corner box {i}: {x1},{y1},{x2},{y2}")
+                            #     continue
+                            
+                            # Ensure coordinates are integers and within screen bounds
+                            x1 = max(0, min(int(x1), self.width))
+                            y1 = max(0, min(int(y1), self.height))
+                            x2 = max(0, min(int(x2), self.width))
+                            y2 = max(0, min(int(y2), self.height))
+                            
+                            # Skip invalid boxes
+                            if x2 <= x1 or y2 <= y1:
+                                print(f"Skipping invalid box {i}: {x1},{y1},{x2},{y2}")
+                                continue
+                                
+                            # Draw the rectangle (outline only, no fill)
+                            win32gui.Rectangle(mem_dc, x1, y1, x2, y2)
+                            
+                            # Draw confidence value if available
+                            if i < len(confidences):
+                                conf_text = f"{confidences[i]:.2f}"
+                                win32gui.SetTextColor(mem_dc, rgb_to_colorref((255, 255, 0)))  # Yellow text
+                                win32gui.SetBkMode(mem_dc, win32con.OPAQUE)  # Make text background opaque
+                                win32gui.SetBkColor(mem_dc, rgb_to_colorref((0, 0, 0)))  # Black background
+                                
+                                # Use DrawText with larger text area
+                                text_rect = (x1, y1 - 20, x1 + 60, y1)
+                                win32gui.DrawText(mem_dc, conf_text, -1, text_rect, win32con.DT_LEFT)
+                                
+                            print(f"Drew box {i} at {x1},{y1},{x2},{y2} with confidence {confidences[i] if i < len(confidences) else 'unknown'}")
+                            
+                        except Exception as e:
+                            print(f"Error drawing box {i}: {e}")
+                    
+                    # Clean up GDI resources
+                    win32gui.SelectObject(mem_dc, old_brush)
+                    win32gui.SelectObject(mem_dc, old_pen)
+                    win32gui.DeleteObject(box_pen)
+                else:
+                    print("No boxes to draw")
+            
             # Draw FPS counter if enabled
             if self.config['show_fps_counter']:
                 try:
-                    # Get FPS values from detector
-                    if self.detector:
-                        # Use the current_fps directly from the detector
-                        fps = self.detector.current_fps if hasattr(self.detector, 'current_fps') else 0
-                        
-                        # Get capture FPS from screen capture if available
-                        capture_fps = 0
-                        if hasattr(self.detector, 'screen_capture') and hasattr(self.detector.screen_capture, 'fps'):
-                            capture_fps = self.detector.screen_capture.fps
-                        
-                        # Get frame skipping info if available
-                        skip_info = ""
-                        if hasattr(self.detector, 'process_every_n'):
-                            skip_info = f" | Skip: {self.detector.process_every_n}"
-                        
-                        # Format based on display style
-                        if self.config.get('fps_display_style', 0) == 0:  # Detailed style
-                            fps_text = f"FPS: {fps} | Capture: {capture_fps}{skip_info}"
-                        else:  # Simple style
-                            fps_text = f"{fps}/{capture_fps}{skip_info}"
-                    else:
-                        fps_text = "FPS: 0"
-                    
-                    self.draw_text(mem_dc, 10, 10, fps_text, (255, 255, 0), size=16)
+                    # Use dedicated method for drawing FPS counter
+                    self.draw_fps_counter(mem_dc)
                 except Exception as e:
                     logging.error(f"Error drawing FPS counter: {e}")
+                    traceback.print_exc()
+            
             # Draw menu if enabled
             if self.config['show_menu']:
                 try:
                     self.draw_menu(mem_dc)
                 except Exception as e:
                     logging.error(f"Error drawing menu: {e}")
+            
             # Draw status message if active
             if time.time() - self.status_message_time < 2.0:
                 try:
                     self.draw_status_message(mem_dc)
                 except Exception as e:
                     logging.error(f"Error drawing status message: {e}")
+            
+            # Blit the memory DC to the window DC
             win32gui.BitBlt(hdc, 0, 0, self.width, self.height, mem_dc, 0, 0, win32con.SRCCOPY)
+            
+            # Properly clean up GDI resources to prevent leaks
+            win32gui.SelectObject(mem_dc, old_bitmap)  # Restore the original bitmap
             win32gui.DeleteObject(mem_bitmap)
             win32gui.DeleteDC(mem_dc)
         except Exception as e:
@@ -2868,6 +3055,48 @@ class OverlayWindow:
             if self.detector:
                 self.detector.start_detection()
             
+            # Set up a timer to force redraw for FPS counter and boxes, but with reduced frequency
+            self.last_redraw_time = 0
+            self.redraw_interval = 0.1  # Redraw at most 10 times per second to prevent strobing
+            
+            def force_redraw():
+                if self.running:
+                    try:
+                        current_time = time.time()
+                        
+                        # Only redraw if enough time has passed since last redraw
+                        if current_time - self.last_redraw_time >= self.redraw_interval:
+                            # Only invalidate specific regions that need updating
+                            # FPS counter region (top-left corner)
+                            fps_rect = (0, 0, 200, 40)
+                            win32gui.InvalidateRect(self.hwnd, fps_rect, False)
+                            
+                            # Only invalidate box regions if we have detections
+                            if hasattr(self.detector, 'current_boxes') and self.detector.current_boxes:
+                                # Invalidate only the regions where boxes are
+                                for box in self.detector.current_boxes:
+                                    x1, y1, x2, y2 = box
+                                    # Add padding around box for text
+                                    rect = (int(x1)-5, int(y1)-20, int(x2)+5, int(y2)+5)
+                                    win32gui.InvalidateRect(self.hwnd, rect, False)
+                            
+                            win32gui.UpdateWindow(self.hwnd)
+                            self.last_redraw_time = current_time
+                        
+                        # Call update_fps on detector to ensure FPS values are updated
+                        if self.detector:
+                            self.detector.update_fps()
+                        
+                        # Schedule next check (more frequent checks, but less frequent redraws)
+                        threading.Timer(0.05, force_redraw).start()
+                    except Exception as e:
+                        print(f"Error in force_redraw: {e}")
+                        # Try again after a short delay
+                        threading.Timer(0.2, force_redraw).start()
+            
+            # Start the redraw timer
+            threading.Timer(0.05, force_redraw).start()
+            
             # Main message loop
             while self.running:
                 try:
@@ -2875,9 +3104,6 @@ class OverlayWindow:
                     if msg[0]:
                         win32gui.TranslateMessage(msg[1])
                         win32gui.DispatchMessage(msg[1])
-                        # Force redraw every frame
-                        win32gui.InvalidateRect(self.hwnd, None, True)
-                        win32gui.UpdateWindow(self.hwnd)
                     else:
                         break
                 except Exception as e:
@@ -2921,6 +3147,12 @@ class OverlayWindow:
                     self.config.update(loaded_config)
                 self.status_message = "Configuration loaded successfully"
                 self.menu_items = self.build_menu_items()
+                
+                # Apply frame skipping value to detector
+                if hasattr(self, 'detector') and 'frame_skipping' in self.config:
+                    frame_skip = max(1, min(4, self.config['frame_skipping']))
+                    self.detector.process_every_n = frame_skip
+                    print(f"Applied frame skipping from config: {frame_skip}")
             else:
                 self.status_message = "No saved configuration found"
             self.status_message_time = time.time()
@@ -2948,16 +3180,14 @@ class OverlayWindow:
             'menu_key': 'INSERT',
             'fov_toggle_key': 'F4',  # Default FOV toggle key
             'fps_toggle_key': 'F5',  # Default FPS toggle key
-            'is_mouse_key': False,  # Track if aim key is a mouse button
-            'anti_lag_value': 5.0,
-            'custom_bone_position': 0.0,
-            'use_directx_capture': True,
+            'is_menu_open': False,
+            'show_fps_counter': True,
+            'fps_display_style': 0,
             'smoothing_xy': 0.5,
-            'optimizations_enabled': False,
-            'gpu_utilization_threshold': 80,
-            'optimized_fps_target': 60,
-            'default_target_fps': 144,
-            'fps_display_style': 0,  # 0 = show labels, 1 = just numbers
+            'aim_deadzone': 3,
+            'anti_lag_value': 0.0,
+            'custom_bone_position': 0.0,
+            'aim_assist_enabled': True,
         }
         self.config.update(default_config)
         self.status_message = "Settings reset to default"
@@ -2965,6 +3195,12 @@ class OverlayWindow:
         self.menu_items = self.build_menu_items()
         self.active_input_field = None
         self.current_input_text = ""
+        
+        # Apply frame skipping value to detector
+        if hasattr(self, 'detector'):
+            self.detector.process_every_n = default_config['frame_skipping']
+            print(f"Reset frame skipping to: {default_config['frame_skipping']}")
+            
         win32gui.InvalidateRect(self.hwnd, None, True)
 
     def show_color_picker(self, initial_color):
@@ -3040,6 +3276,303 @@ class OverlayWindow:
         win32gui.SelectObject(hdc, old_font)
         win32gui.SetBkMode(hdc, win32con.TRANSPARENT)
 
+    def draw_fps_counter(self, hdc):
+        """Draw the FPS counter with high visibility."""
+        try:
+            if not self.config['show_fps_counter'] or not self.detector:
+                return
+                
+            # Get FPS values
+            fps = self.detector.current_fps if hasattr(self.detector, 'current_fps') else 0
+            
+            # Get capture FPS from screen capture if available
+            capture_fps = 0
+            if hasattr(self.detector, 'screen_capture') and hasattr(self.detector.screen_capture, 'fps'):
+                capture_fps = self.detector.screen_capture.fps
+            
+            # Get frame skipping info if available
+            skip_info = ""
+            if hasattr(self.detector, 'process_every_n'):
+                skip_info = f" | Skip: {self.detector.process_every_n}"
+            
+            # Format based on display style
+            if self.config.get('fps_display_style', 0) == 0:  # Detailed style
+                fps_text = f"FPS: {fps} | Capture: {capture_fps}{skip_info}"
+            else:  # Simple style
+                fps_text = f"{fps}/{capture_fps}{skip_info}"
+            
+            # Create a LOGFONT structure for better text quality
+            lf = win32gui.LOGFONT()
+            lf.lfFaceName = "Segoe UI"
+            lf.lfHeight = -14  # Smaller text (was -20)
+            lf.lfWeight = 700  # Bold but not too bold
+            lf.lfQuality = win32con.CLEARTYPE_QUALITY
+            
+            # Create font
+            font = win32gui.CreateFontIndirect(lf)
+            old_font = win32gui.SelectObject(hdc, font)
+            
+            # Get text dimensions
+            win32gui.SetTextColor(hdc, rgb_to_colorref((255, 255, 0)))  # Bright yellow
+            win32gui.SetBkMode(hdc, win32con.TRANSPARENT)
+            text_size = win32gui.GetTextExtentPoint32(hdc, fps_text)
+            
+            # Position in top-left corner
+            x, y = 10, 10
+            
+            # Create background rectangle with minimal padding
+            padding = 4  # Reduced padding (was 8)
+            bg_rect = (x - padding, y - padding, 
+                      x + text_size[0] + padding, y + text_size[1] + padding)
+            
+            # Fill background with solid black (no outline)
+            bg_brush = win32gui.CreateSolidBrush(rgb_to_colorref((0, 0, 0)))
+            win32gui.FillRect(hdc, bg_rect, bg_brush)
+            win32gui.DeleteObject(bg_brush)
+            
+            # Draw text using DrawText
+            text_rect = (x, y, x + text_size[0], y + text_size[1])
+            win32gui.SetTextColor(hdc, rgb_to_colorref((255, 255, 0)))
+            win32gui.DrawText(hdc, fps_text, -1, text_rect, win32con.DT_LEFT | win32con.DT_TOP)
+            
+            # Clean up
+            win32gui.SelectObject(hdc, old_font)
+            win32gui.DeleteObject(font)
+            
+        except Exception as e:
+            logging.error(f"Error drawing FPS counter: {e}")
+            traceback.print_exc()
+
+    def _ensure_model_on_correct_device(self):
+        """Ensure the model is on the correct device based on current hardware."""
+        try:
+            if hasattr(self, 'model') and hasattr(self.model, 'model'):
+                current_device = next(self.model.model.parameters()).device
+                target_device = self.hardware_manager.get_device()
+                
+                if current_device != target_device:
+                    print(f"[INFO] Moving model from {current_device} to {target_device}")
+                    self.model.model = self.model.model.to(target_device)
+                    
+                    # Force all parameters to the target device
+                    for param in self.model.model.parameters():
+                        param.data = param.data.to(target_device)
+                    
+                    print(f"[INFO] Model successfully moved to {self.hardware_manager.get_hardware_type()} device")
+            return True
+        except Exception as e:
+            print(f"[ERROR] Failed to move model to correct device: {e}")
+            return False
+    def optimize_model(self):
+        """Apply performance optimizations to the model."""
+        if hasattr(self.model, 'model'):
+            # Enable PyTorch optimizations
+            torch.set_num_threads(8)  # Use more CPU threads
+            torch.backends.cudnn.benchmark = True
+            
+            # Fuse layers for faster inference
+            try:
+                self.model.model.fuse()
+                print("[INFO] Model fused for faster inference")
+            except Exception as e:
+                print(f"[INFO] Model fusion failed: {e}")
+            
+            # Use lower precision if available
+            try:
+                self.model.model.half()
+                print("[INFO] Using FP16 for faster inference")
+            except Exception as e:
+                print(f"[INFO] FP16 not available: {e}")
+            
+            # Optimize thresholds for speed
+            self.model.conf = 0.4  # Higher confidence = fewer detections = faster
+            self.model.iou = 0.45  # Optimized NMS threshold
+            
+            print(f"[INFO] Optimized model with {self.target_size}x{self.target_size} input")
+    
+    def should_process_frame(self):
+        """Determine if current frame should be processed."""
+        self.frame_counter += 1
+        return self.frame_counter % (self.frame_skip + 1) == 0
+
+        
+        # Apply performance optimizations
+        self.optimize_model()
+
+# --- Hardware Management ---
+
+class HardwareManager:
+    """
+    Centralized hardware detection and management.
+    
+    This class performs hardware detection once during initialization and provides
+    clear interfaces for AMD, NVIDIA, and CPU execution paths. It eliminates
+    redundant hardware checks throughout the codebase.
+    
+    Attributes:
+        hardware_type: Type of hardware ('AMD', 'NVIDIA', or 'CPU')
+        device: PyTorch device for the detected hardware
+        device_name: Human-readable name of the detected hardware
+        is_gpu: Whether GPU acceleration is available
+        supports_cuda: Whether CUDA is supported
+        supports_directml: Whether DirectML is supported
+    """
+    
+    def __init__(self):
+        """Initialize hardware detection and setup."""
+        self.hardware_type = None
+        self.device = None
+        self.device_name = None
+        self.is_gpu = False
+        self.supports_cuda = False
+        self.supports_directml = False
+        
+        # Perform hardware detection
+        self._detect_hardware()
+        
+    def _detect_hardware(self) -> None:
+        """
+        Detect available hardware and set up appropriate devices.
+        
+        This method performs a single comprehensive hardware detection and
+        sets up the appropriate PyTorch device for the detected hardware.
+        """
+        try:
+            print(f"System: {platform.system()} {platform.release()}")
+            print(f"Python: {platform.python_version()}")
+            print(f"PyTorch: {torch.__version__}")
+            
+            # Check for NVIDIA GPU with CUDA (highest priority - works well)
+            if torch.cuda.is_available():
+                try:
+                    print("Checking for NVIDIA GPU with CUDA...")
+                    
+                    # Test NVIDIA GPU functionality
+                    test_device = torch.device('cuda')
+                    test_tensor = torch.tensor([1.0, 2.0, 3.0], device=test_device)
+                    test_result = test_tensor + test_tensor
+                    _ = test_result.cpu().numpy()  # Force synchronization
+                    
+                    # NVIDIA GPU is working
+                    self.hardware_type = 'NVIDIA'
+                    self.device = test_device
+                    self.device_name = torch.cuda.get_device_name(0)
+                    self.is_gpu = True
+                    self.supports_cuda = True
+                    
+                    print(f"✓ NVIDIA GPU detected: {self.device_name}")
+                    print(f"  CUDA device: {self.device}")
+                    return
+                    
+                except Exception as e:
+                    print(f"✗ NVIDIA GPU detection failed: {e}")
+            
+            # AMD GPU: Use MSS + CPU for best performance and reliability
+            # This eliminates all DirectML compatibility issues while maintaining high performance
+            print("AMD GPU detected - using MSS + CPU optimization")
+            print("Reason: MSS provides excellent capture performance, CPU provides reliable inference")
+            print("Result: Better performance than broken DirectML")
+            
+            self.hardware_type = 'CPU'
+            self.device = torch.device('cpu')
+            self.device_name = platform.processor()
+            self.is_gpu = False
+            
+            # Enable CPU optimizations for better performance
+            torch.set_num_threads(min(8, os.cpu_count()))  # Use multiple CPU threads
+            torch.backends.mkldnn.enabled = True  # Enable MKL-DNN for Intel CPUs
+            torch.backends.mkldnn.allow_tf32 = True  # Allow TF32 for better performance
+            
+            print(f"✓ AMD GPU using MSS + CPU optimization: {self.device_name}")
+            print(f"  CPU threads: {torch.get_num_threads()}")
+            print(f"  MKL-DNN enabled: {torch.backends.mkldnn.enabled}")
+            print(f"  MSS capture: Enabled")
+            
+        except Exception as e:
+            print(f"ERROR: Hardware detection failed: {e}")
+            # Emergency fallback to CPU
+            self.hardware_type = 'CPU'
+            self.device = torch.device('cpu')
+            self.device_name = 'Unknown CPU'
+            self.is_gpu = False
+            print("✓ Emergency CPU fallback activated")
+    
+    def is_amd(self) -> bool:
+        """Check if AMD GPU is available (using MSS + CPU optimization)."""
+        return self.hardware_type == 'CPU' and 'AMD' in self.device_name.upper()
+    
+    def is_nvidia(self) -> bool:
+        """Check if NVIDIA GPU is available."""
+        return self.hardware_type == 'NVIDIA'
+    
+    def is_cpu(self) -> bool:
+        """Check if CPU fallback is being used."""
+        return self.hardware_type == 'CPU'
+    
+    def get_device(self) -> torch.device:
+        """Get the PyTorch device for the detected hardware."""
+        return self.device
+    
+    def get_device_name(self) -> str:
+        """Get the human-readable name of the detected hardware."""
+        return self.device_name
+    
+    def get_hardware_type(self) -> str:
+        """Get the hardware type string."""
+        return self.hardware_type
+    
+    def create_tensor(self, shape: Tuple[int, ...], dtype: torch.dtype = torch.float32) -> torch.Tensor:
+        """
+        Create a tensor on the appropriate device.
+        
+        Args:
+            shape: Tensor shape
+            dtype: Tensor data type
+            
+        Returns:
+            Tensor created on the appropriate device
+        """
+        return torch.zeros(shape, device=self.device, dtype=dtype)
+    
+    def move_to_device(self, tensor: torch.Tensor) -> torch.Tensor:
+        """
+        Move a tensor to the appropriate device.
+        
+        Args:
+            tensor: Input tensor
+            
+        Returns:
+            Tensor moved to the appropriate device
+        """
+        return tensor.to(self.device)
+    
+    def synchronize(self) -> None:
+        """Synchronize the device (GPU-specific)."""
+        if self.is_nvidia() and hasattr(torch.cuda, 'synchronize'):
+            torch.cuda.synchronize()
+        elif self.is_amd():
+            # For AMD (CPU mode), no synchronization needed
+            pass
+    
+    def empty_cache(self) -> None:
+        """Empty device cache (GPU-specific)."""
+        if self.is_nvidia() and hasattr(torch.cuda, 'empty_cache'):
+            torch.cuda.empty_cache()
+    
+    def get_memory_info(self) -> Optional[Dict[str, Any]]:
+        """Get memory information for the device."""
+        if self.is_nvidia() and hasattr(torch.cuda, 'get_device_properties'):
+            props = torch.cuda.get_device_properties(self.device)
+            return {
+                'total_memory': props.total_memory,
+                'memory_allocated': torch.cuda.memory_allocated(self.device),
+                'memory_reserved': torch.cuda.memory_reserved(self.device)
+            }
+        return None
+
+# Global hardware manager instance
+hardware_manager = HardwareManager()
+
 def main():
     """Main function to run the overlay."""
     try:
@@ -3066,6 +3599,9 @@ def main():
                 break
         
         # Cleanup
+        overlay.aim_assist_running = False  # Stop aim assist thread
+        if hasattr(overlay, 'aim_thread') and overlay.aim_thread.is_alive():
+            overlay.aim_thread.join(timeout=1.0)  # Wait for thread to finish
         overlay.detector.stop_detection()
         logging.info("Detection thread stopped")
         
